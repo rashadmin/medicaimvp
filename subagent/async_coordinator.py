@@ -37,18 +37,26 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # [CHECKPOINT 0] — graph import
 print("\n[CHECKPOINT 0] importing rag_graph...", flush=True)
 try:
-    from rag_subagent.rag_searcher import graph as rag_graph
+    from subagent.rag_searcher import graph as rag_graph
+    from subagent.youtube_subagent import graph as youtube_graph
+    from subagent.hospital_notifier import graph as hospital_graph
     print("[CHECKPOINT 0] ✅ rag_graph imported successfully", flush=True)
     print(f"[CHECKPOINT 0]    type(rag_graph) = {type(rag_graph)}", flush=True)
     print(f"[CHECKPOINT 0]    has ainvoke    = {hasattr(rag_graph, 'ainvoke')}", flush=True)
     print(f"[CHECKPOINT 0]    has invoke     = {hasattr(rag_graph, 'invoke')}", flush=True)
+    print("[CHECKPOINT 0] ✅ youtube_graph imported successfully", flush=True)
+    print(f"[CHECKPOINT 0]    type(youtube_graph) = {type(youtube_graph)}", flush=True)
+    print(f"[CHECKPOINT 0]    has ainvoke    = {hasattr(youtube_graph, 'ainvoke')}", flush=True)
+    print(f"[CHECKPOINT 0]    has invoke     = {hasattr(youtube_graph, 'invoke')}", flush=True)
 except Exception as e:
-    print(f"[CHECKPOINT 0] ❌ FAILED to import rag_graph: {e}", flush=True)
+    print(f"[CHECKPOINT 0] ❌ FAILED to import graph: {e}", flush=True)
     traceback.print_exc()
     raise
 
 GRAPHS: dict[str, Any] = {
     "rag_searcher": rag_graph,
+    "youtube_subagent":youtube_graph,
+    "hospital_notifier": hospital_graph
 }
 
 # ── SQLite ────────────────────────────────────────────────────────────────────
@@ -186,16 +194,30 @@ async def _execute_run(
 
         # ── persist to DB ─────────────────────────────────────────────────
         print(f"[CHECKPOINT 8] persisting result to DB...", flush=True)
-        assistant_msg = {"role": "assistant", "content": output}
+        # assistant_msg = {"role": "assistant", "content": output}
+        def _serialize_msg(m) -> dict:
+            return {
+                "type":    getattr(m, "type", "ai"),
+                "name":    getattr(m, "name", None),
+                "content": m.content if hasattr(m, "content") else str(m),
+            }
+        
+        serialized = [_serialize_msg(m) for m in messages] 
         async with _db_lock:
-            row  = _conn.execute(
-                "SELECT messages FROM threads WHERE thread_id=?", (thread_id,)
-            ).fetchone()
-            msgs = json.loads(row[0]) if row else []
-            msgs.append(assistant_msg)
+            # row  = _conn.execute(
+            #     "SELECT messages FROM threads WHERE thread_id=?", (thread_id,)
+            # ).fetchone()
+            # msgs = json.loads(row[0]) if row else []
+            # msgs.append(assistant_msg)
+            # _conn.execute(
+            #     "UPDATE threads SET messages=?, values_=? WHERE thread_id=?",
+            #     (json.dumps(msgs), json.dumps({"messages": msgs}), thread_id),
+            # )
+            # _conn.execute("UPDATE runs SET status='success' WHERE run_id=?", (run_id,))
+            # _conn.commit()
             _conn.execute(
-                "UPDATE threads SET messages=?, values_=? WHERE thread_id=?",
-                (json.dumps(msgs), json.dumps({"messages": msgs}), thread_id),
+            "UPDATE threads SET messages=?, values_=? WHERE thread_id=?",
+            (json.dumps(serialized), json.dumps({"messages": serialized}), thread_id),
             )
             _conn.execute("UPDATE runs SET status='success' WHERE run_id=?", (run_id,))
             _conn.commit()

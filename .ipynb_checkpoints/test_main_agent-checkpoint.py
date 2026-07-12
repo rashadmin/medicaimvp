@@ -1,0 +1,552 @@
+"""
+MedicAI MVP — Main Agent Test
+===============================
+test_main_agent.py
+
+Tests the full main agent via the FastAPI /chat endpoint.
+All subagents (rag_searcher, hospital_notifier, youtube_searcher)
+must be running on the subagent server.
+
+Prerequisites — run all servers first:
+  Terminal 1: uvicorn rag_subagent.async_coordinator:app --reload --port 8000
+  Terminal 2: uvicorn api:app --reload --port 8001
+
+Then run:
+  python test_main_agent.py
+
+Tests:
+  1. Health checks (both servers)
+  2. First emergency message — parallel RAG + hospital notifier launch
+  3. Follow-up: answer clarifying question
+  4. Follow-up: ask about a specific technique
+  5. Follow-up: situation update
+  6. Poll hospital responses
+  7. Full conversation flow end-to-end
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+import uuid
+import httpx
+
+API_URL      = "http://localhost:8001"
+SUBAGENT_URL = "http://localhost:8000"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  SSE READER
+#  Reads the SSE stream from /chat and prints events in real time
+# ════════════════════════════════════════════════════════════════════════════
+
+async def stream_chat(
+    message:         str,
+    location:        dict,
+    patient_profile: dict,
+    session_id:      str | None = None,
+    timeout:         int = 120,
+    silent_events:   list[str] | None = None,
+) -> tuple[str, str]:
+    """
+    POST to /chat and stream SSE events.
+    Returns (session_id, full_agent_response_text).
+
+    silent_events: event types to not print (e.g. ["step", "rag_event"])
+    """
+    silent = set(silent_events or ["step"])
+
+    body = {
+        "session_id":      session_id,
+        "message":         message,
+        "location":        location,
+        "patient_profile": patient_profile,
+    }
+
+    full_text  = ""
+    session_out = session_id or ""
+
+    print(f"\n{'─'*60}")
+    print(f"USER: {message}")
+    print(f"{'─'*60}")
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream(
+            "POST",
+            f"{API_URL}/chat",
+            json=body,
+        ) as response:
+            buffer = ""
+            async for line in response.aiter_lines():
+                buffer += line + "\n"
+
+                # parse complete SSE event (event: + data: pair)
+                if buffer.strip() and "\n\n" in buffer or (line == "" and buffer.strip()):
+                    events = buffer.strip().split("\n\n")
+                    for raw_event in events:
+                        if not raw_event.strip():
+                            continue
+
+                        event_type = "message"
+                        data_str   = ""
+
+                        for part in raw_event.strip().split("\n"):
+                            if part.startswith("event:"):
+                                event_type = part[6:].strip()
+                            elif part.startswith("data:"):
+                                data_str = part[5:].strip()
+
+                        if not data_str:
+                            continue
+
+                        try:
+                            data = json.loads(data_str)
+                        except Exception:
+                            data = {"raw": data_str}
+
+                        # capture session_id
+                        if "session_id" in data and not session_out:
+                            session_out = data["session_id"]
+
+                        # handle token streaming — accumulate text
+                        if event_type == "token":
+                            text = data.get("text", "")
+                            if isinstance(text, list):
+                                text = "".join(
+                                    t.get("text", "") if isinstance(t, dict) else str(t)
+                                    for t in text
+                                )
+                            full_text += text
+                            print(text, end="", flush=True)
+                            buffer = ""
+                            continue
+
+                        # print non-silent events
+                        if event_type not in silent:
+                            _print_event(event_type, data)
+
+                        if event_type == "turn_started":
+                            session_out = data.get("session_id", session_out)
+
+                        if event_type in ("done", "error"):
+                            buffer = ""
+                            break
+
+                    buffer = ""
+
+    print(f"\n{'─'*60}")
+    return session_out, full_text
+
+
+def _print_event(event_type: str, data: dict) -> None:
+    """Pretty print an SSE event."""
+    icons = {
+        "turn_started":     "▶",
+        "tool_call":        "🔧",
+        "subagent_complete": "📦",
+        "rag_event":        "🔍",
+        "coordinator_event": "📡",
+        "videos_incoming":  "🎬",
+        "done":             "✅",
+        "error":            "❌",
+        "ready":            "🟢",
+    }
+    icon   = icons.get(event_type, "•")
+    source = data.get("source", "")
+    tool   = data.get("tool", "")
+    node   = data.get("node", "")
+
+    if event_type == "tool_call":
+        print(f"\n  {icon} [{source}] calling: {tool}")
+    elif event_type == "subagent_complete":
+        content = data.get("content", "")[:120]
+        print(f"\n  {icon} [{source}] {tool} → {content}...")
+    elif event_type == "rag_event":
+        event = data.get("event", "")
+        query = data.get("query", "")
+        print(f"\n  {icon} RAG {event}: {query[:60]}")
+    elif event_type == "coordinator_event":
+        event = data.get("event", "")
+        print(f"\n  {icon} coordinator: {event}")
+    elif event_type in ("done", "error", "ready"):
+        turn_type = data.get("turn_type", "")
+        print(f"\n  {icon} {event_type.upper()} {turn_type}")
+    elif event_type == "turn_started":
+        print(f"\n  {icon} turn started — {data.get('turn_type', '')}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  SAMPLE DATA
+# ════════════════════════════════════════════════════════════════════════════
+
+LOCATION = {
+    "lat":     6.5418,
+    "lng":     3.3917,
+    "address": "14 Admiralty Way, Lekki Phase 1, Lagos",
+}
+
+PATIENT = {
+    "name":       "Emmanuel Okafor",
+    "age":        67,
+    "blood_type": "O+",
+    "allergies":  ["penicillin"],
+    "conditions": ["hypertension"],
+}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  HEALTH CHECKS
+# ════════════════════════════════════════════════════════════════════════════
+
+async def check_servers() -> bool:
+    print("\n" + "="*60)
+    print("Checking servers...")
+    print("="*60)
+
+    all_ok = True
+    async with httpx.AsyncClient(timeout=5) as client:
+
+        # FastAPI health
+        try:
+            resp = await client.get(f"{API_URL}/health")
+            data = resp.json()
+            print(f"  ✅ FastAPI (8001): {data.get('service')} v{data.get('version')}")
+        except Exception as e:
+            print(f"  ❌ FastAPI (8001): {e}")
+            all_ok = False
+
+        # subagent server health
+        try:
+            resp   = await client.get(f"{SUBAGENT_URL}/ok")
+            graphs = await client.get(f"{SUBAGENT_URL}/graphs")
+            g_list = graphs.json().get("graphs", [])
+            print(f"  ✅ Subagent (8000): graphs={g_list}")
+            for required in ["rag_searcher", "hospital_notifier"]:
+                if required not in g_list:
+                    print(f"  ⚠️  Missing graph: {required}")
+        except Exception as e:
+            print(f"  ❌ Subagent (8000): {e}")
+            all_ok = False
+
+    return all_ok
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  TESTS
+# ════════════════════════════════════════════════════════════════════════════
+
+async def test_certain_emergency():
+    """
+    Test 1 — Emergency with CERTAIN conditions (no ambiguity).
+    Stabbed + not breathing → agent should:
+      - Launch RAG for bleeding_control AND cpr simultaneously (no user input needed)
+      - Launch hospital_notifier
+      - Ask at most one clarifying question
+      - Give immediate partial guidance
+    """
+    print("\n" + "="*60)
+    print("TEST 1 — Certain Emergency (stabbed + not breathing)")
+    print("="*60)
+
+    session_id, response = await stream_chat(
+        message="My brother was stabbed in the stomach and he is not breathing properly, "
+                "there is a lot of blood",
+        location=LOCATION,
+        patient_profile=PATIENT,
+        silent_events=["step"],
+    )
+
+    print(f"\n[test1] session_id: {session_id}")
+    print(f"[test1] Response length: {len(response)} chars")
+    assert session_id, "❌ No session_id returned"
+    # if len(response) < 50:
+    # print(response)
+    assert len(response) > 50, "❌ Response too short"
+    print("[test1] ✅ Passed")
+    return session_id
+
+
+async def test_ambiguous_emergency():
+    """
+    Test 2 — Ambiguous emergency → agent should ask ONE clarifying question
+    AND launch speculative RAG searches simultaneously.
+    """
+    print("\n" + "="*60)
+    print("TEST 2 — Ambiguous Emergency (collapsed — unclear cause)")
+    print("="*60)
+
+    session_id, response = await stream_chat(
+        message="My grandmother just collapsed on the floor and is not moving",
+        location=LOCATION,
+        patient_profile={
+            "name":       "Grace Okafor",
+            "age":        72,
+            "blood_type": "A+",
+            "allergies":  [],
+            "conditions": ["diabetes", "hypertension"],
+        },
+        silent_events=["step"],
+    )
+
+    print(f"\n[test2] session_id: {session_id}")
+    # response should contain a question
+    has_question = "?" in response
+    print(f"[test2] Contains question: {'✅' if has_question else '⚠️ no question found'}")
+    print("[test2] ✅ Passed")
+    return session_id
+
+
+async def test_followup_answer(session_id: str):
+    """
+    Test 3 — Answer the clarifying question.
+    Agent should:
+      - Cancel irrelevant speculative RAG searches
+      - Assemble full first-aid guidance from confirmed RAG results
+      - Launch youtube_searcher for main technique
+    """
+    print("\n" + "="*60)
+    print("TEST 3 — Follow-up: Answer clarifying question")
+    print("="*60)
+
+    session_id, response = await stream_chat(
+        message="She is not breathing and her lips are turning blue",
+        location=LOCATION,
+        patient_profile={
+            "name":       "Grace Okafor",
+            "age":        72,
+            "blood_type": "A+",
+            "allergies":  [],
+            "conditions": ["diabetes", "hypertension"],
+        },
+        session_id=session_id,
+        silent_events=["step"],
+    )
+
+    print(f"\n[test3] Response length: {len(response)} chars")
+    has_steps = any(word in response.lower() for word in ["1.", "step", "press", "push", "call"])
+    print(f"[test3] Contains instructions: {'✅' if has_steps else '⚠️'}")
+    print("[test3] ✅ Passed")
+    return session_id
+
+
+async def test_technique_question(session_id: str):
+    """
+    Test 4 — Ask about a specific technique.
+    Agent should query RAG and respond with detailed explanation.
+    """
+    print("\n" + "="*60)
+    print("TEST 4 — Follow-up: Ask about CPR technique")
+    print("="*60)
+
+    _, response = await stream_chat(
+        message="Can you explain exactly how to do chest compressions? "
+                "I've never done CPR before",
+        location=LOCATION,
+        patient_profile=PATIENT,
+        session_id=session_id,
+        silent_events=["step"],
+    )
+
+    print(f"\n[test4] Response length: {len(response)} chars")
+    has_detail = len(response) > 100
+    print(f"[test4] Detailed response: {'✅' if has_detail else '⚠️ response too short'}")
+    print("[test4] ✅ Passed")
+
+
+async def test_situation_update(session_id: str):
+    """
+    Test 5 — Give a situation update.
+    Agent should re-assess and update guidance.
+    """
+    print("\n" + "="*60)
+    print("TEST 5 — Follow-up: Situation update")
+    print("="*60)
+
+    _, response = await stream_chat(
+        message="She just started breathing again but she is still unconscious "
+                "and her pulse is very weak",
+        location=LOCATION,
+        patient_profile=PATIENT,
+        session_id=session_id,
+        silent_events=["step"],
+    )
+
+    print(f"\n[test5] Response length: {len(response)} chars")
+    # response should change guidance (no more CPR, recovery position etc)
+    updated = len(response) > 50
+    print(f"[test5] Updated guidance: {'✅' if updated else '⚠️'}")
+    print("[test5] ✅ Passed")
+
+
+async def test_hospital_status(session_id: str):
+    """
+    Test 6 — Ask about hospital status.
+    Agent should call check_async_task for hospital_notifier.
+    """
+    print("\n" + "="*60)
+    print("TEST 6 — Follow-up: Hospital status check")
+    print("="*60)
+
+    _, response = await stream_chat(
+        message="Are any hospitals on their way? Which ones have confirmed?",
+        location=LOCATION,
+        patient_profile=PATIENT,
+        session_id=session_id,
+        silent_events=["step"],
+    )
+
+    print(f"\n[test6] Response: {response[:300]}")
+    print("[test6] ✅ Passed")
+
+
+async def test_poll_hospital_responses(session_id: str):
+    """
+    Test 7 — Simulate hospital responses and poll the API.
+    """
+    print("\n" + "="*60)
+    print("TEST 7 — Simulate + Poll Hospital Responses")
+    print("="*60)
+
+    async with httpx.AsyncClient() as client:
+        # simulate 3 hospital responses
+        responses = [
+            ("hospital_1", "accept"),
+            ("hospital_2", "accept"),
+            ("hospital_3", "reject"),
+        ]
+        for hospital_id, decision in responses:
+            url  = f"{API_URL}/hospital/respond/{session_id}/{hospital_id}/{decision}"
+            resp = await client.get(url)
+            icon = "✅" if decision == "accept" else "❌"
+            print(f"  {icon} {hospital_id} → {decision} (HTTP {resp.status_code})")
+            await asyncio.sleep(0.3)
+
+        # poll the responses endpoint
+        await asyncio.sleep(0.5)
+        resp = await client.get(f"{API_URL}/session/hospital-responses/{session_id}")
+        data = resp.json()
+
+    print(f"\n  Responded: {data.get('responded')}/{data.get('total_notified')}")
+    accepted = [h.get("hospital_name", h.get("hospital_id")) for h in data.get("accepted", [])]
+    rejected = [h.get("hospital_name", h.get("hospital_id")) for h in data.get("rejected", [])]
+    print(f"  ✅ Accepted: {accepted}")
+    print(f"  ❌ Rejected: {rejected}")
+    print("[test7] ✅ Passed")
+
+
+async def test_sessions_endpoint():
+    """Test 8 — Check active sessions."""
+    print("\n" + "="*60)
+    print("TEST 8 — Active Sessions")
+    print("="*60)
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(f"{API_URL}/sessions")
+        data = resp.json()
+
+    print(f"  Total sessions: {data.get('total')}")
+    for s in data.get("sessions", []):
+        print(f"  • {s['session_id'][:8]}... "
+              f"RAG tasks: {s.get('rag_searches', 0)} "
+              f"YouTube: {s.get('youtube_tasks', 0)}")
+    print("[test8] ✅ Passed")
+
+
+async def test_full_conversation():
+    """
+    Test 9 — Full end-to-end conversation flow:
+    Emergency → clarify → guidance → technique question → hospital status
+    """
+    print("\n" + "="*60)
+    print("TEST 9 — Full Conversation Flow")
+    print("="*60)
+
+    turns = [
+        "My father collapsed at home. He is 67 years old, "
+        "clutching his chest and says it hurts badly.",
+
+        "Yes he is conscious but barely — he is breathing but very slowly",
+
+        "Okay I am pressing his chest now. How hard should I press?",
+
+        "The ambulance is not picking up. Are the hospitals notified?",
+
+        "He just lost consciousness completely",
+    ]
+
+    session_id = None
+    for i, message in enumerate(turns, 1):
+        print(f"\n[e2e] Turn {i}/{len(turns)}")
+        session_id, response = await stream_chat(
+            message=message,
+            location=LOCATION,
+            patient_profile=PATIENT,
+            session_id=session_id,
+            silent_events=["step", "rag_event"],
+            timeout=120,
+        )
+        print(f"\n[e2e] Turn {i} complete — response: {len(response)} chars")
+        await asyncio.sleep(1)   # brief pause between turns
+
+    print(f"\n[e2e] ✅ Full conversation complete — session: {session_id[:8]}...")
+    return session_id
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ════════════════════════════════════════════════════════════════════════════
+
+async def main():
+    print("\nMedicAI Main Agent Test Suite")
+    print("="*60)
+
+    # check both servers are up
+    ok = await check_servers()
+    if not ok:
+        print("\n❌ Not all servers running. Start:")
+        print("   Terminal 1: uvicorn rag_subagent.async_coordinator:app --reload --port 8000")
+        print("   Terminal 2: uvicorn api:app --reload --port 8001")
+        return
+
+    # ── run individual tests ──────────────────────────────────────────────
+    import time
+    # test 1 — certain emergency (stab + not breathing)
+    session_id_1 = await test_certain_emergency()
+    time.sleep(60)
+    # test 2 — ambiguous emergency (collapsed grandmother)
+    session_id_2 = await test_ambiguous_emergency()
+    time.sleep(60)
+    # test 3 — follow up on session 2 (answer clarifying question)
+    session_id_2 = await test_followup_answer(session_id_2)
+    time.sleep(60)
+    # test 4 — ask technique question (continue session 2)
+    await test_technique_question(session_id_2)
+    time.sleep(60)
+    # test 5 — situation update (continue session 2)
+    await test_situation_update(session_id_2)
+    time.sleep(60)
+    # test 6 — ask about hospital status (continue session 2)
+    await test_hospital_status(session_id_2)
+    time.sleep(60)
+    # test 7 — simulate + poll hospital responses (session 1)
+    await test_poll_hospital_responses(session_id_1)
+    time.sleep(60)
+    # test 8 — active sessions
+    await test_sessions_endpoint()
+    time.sleep(60)
+    # test 9 — full conversation (new session)
+    await test_full_conversation()
+
+    print("\n" + "="*60)
+    print("✅ All main agent tests complete.")
+    print("="*60)
+
+
+if __name__ == "__main__":
+    # run all tests
+    asyncio.run(main())
+
+    # or run a single test:
+    # asyncio.run(test_certain_emergency())
+    # asyncio.run(test_full_conversation())

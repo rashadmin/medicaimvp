@@ -25,10 +25,11 @@ from __future__ import annotations
 import os
 import asyncio
 from typing import Any
-
+import faiss, numpy as np, pickle
+import pandas as pd
 import httpx
 from langchain_core.tools import tool
-from langgraph.config import get_stream_writer
+# from langgraph.config import get_stream_writer
 
 # ── at the top of rag_tool.py ─────────────────────────────────────────────
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
@@ -73,53 +74,40 @@ async def _search_vector_store(
         }
     }
     """
-    # ── Pinecone example ──────────────────────────────────────────────────
-    # from pinecone import Pinecone
-    # pc    = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-    # index = pc.Index(os.getenv("PINECONE_INDEX", "medic-first-aid"))
-    # results = index.query(
-    #     vector=query_embedding,
-    #     top_k=top_k,
-    #     filter={"tags": {"$in": filter_tags}} if filter_tags else None,
-    #     include_metadata=True,
-    # )
-    # return [
-    #     {
-    #         "id":       m.id,
-    #         "score":    m.score,
-    #         "content":  m.metadata.get("text", ""),
-    #         "metadata": m.metadata,
-    #     }
-    #     for m in results.matches
-    # ]
 
-    # ── Chroma example ────────────────────────────────────────────────────
-    # import chromadb
-    # client     = chromadb.HttpClient(host=os.getenv("CHROMA_HOST", "localhost"), port=8080)
-    # collection = client.get_collection("first_aid")
-    # results    = collection.query(
-    #     query_embeddings=[query_embedding],
-    #     n_results=top_k,
-    #     where={"tags": {"$in": filter_tags}} if filter_tags else None,
-    # )
-    # return [
-    #     {
-    #         "id":       results["ids"][0][i],
-    #         "score":    1 - results["distances"][0][i],
-    #         "content":  results["documents"][0][i],
-    #         "metadata": results["metadatas"][0][i],
-    #     }
-    #     for i in range(len(results["ids"][0]))
-    # ]
+    import os
 
-    # ── STUB — replace with real implementation ───────────────────────────
+# Get the directory of the current script/notebook
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # for .py files
+    # or for Jupyter:
+    # BASE_DIR = os.getcwd()
+    
+    faiss_path = os.path.join(BASE_DIR, "..", "index.faiss")
+    df_path = os.path.join(BASE_DIR, "..", "documents.pkl")
+    
+    index = faiss.read_index(faiss_path)
+    df = pd.read_pickle(df_path)
+    # 1. Load FAISS index + df
+    # index = faiss.read_index("../index.faiss")
+    # df = pd.read_pickle("../documents.pkl")
+
+
+
+    query_embedding  = np.array(query_embedding).astype('float32').reshape(1, -1)
+    # 3. Search FAISS
+    top_k = 5
+    distances, indices = index.search(query_embedding, top_k)
+    
+    # 4. Link back to original df
+    results = df.iloc[indices[0]].copy()
+    results['distance'] = distances[0]
     await asyncio.sleep(0.1)   # simulate network call
     return [
         {
             "id":      f"chunk_{i}",
-            "score":   0.95 - (i * 0.05),
-            "content": f"[STUB] First aid content for query (chunk {i+1}). Replace with real vector store.",
-            "metadata": {"source": "stub", "topic": "general", "tags": []},
+            "score":   results['distance'].to_list()[i],
+            "content":     results['text'].to_list()[i],
+            "metadata": {"source": results['source'].to_list()[i]},
         }
         for i in range(top_k)
     ]
@@ -131,7 +119,7 @@ def _rerank_results(results: list[dict], query: str) -> list[dict]:
     For production use a dedicated reranker (Cohere, BGE, etc.)
     """
     return sorted(
-        [r for r in results if r["score"] > 0.6],
+        [r for r in results if r["score"] > 0.3],
         key=lambda x: x["score"],
         reverse=True,
     )
@@ -141,7 +129,7 @@ def _rerank_results(results: list[dict], query: str) -> list[dict]:
 #  RAG TOOL
 # ════════════════════════════════════════════════════════════════════════════
 
-@tool
+# @tool
 async def search_first_aid_rag(
     query: str,
     tags: list[str] | None = None,
@@ -163,13 +151,13 @@ async def search_first_aid_rag(
 
     Returns structured first-aid content with source citations.
     """
-    writer = get_stream_writer()
-    writer({"event": "rag_search_started", "query": query, "tags": tags})
+    # writer = get_stream_writer()
+    # writer({"event": "rag_search_started", "query": query, "tags": tags})
 
     try:
         # step 1: embed the query
         query_embedding = await _embed_query(query)
-
+        print(type(query_embedding))
         # step 2: search vector store
         raw_results = await _search_vector_store(
             query_embedding, top_k=top_k, filter_tags=tags
@@ -185,8 +173,8 @@ async def search_first_aid_rag(
             for r in ranked_results
         ])
 
-        writer({"event": "rag_search_complete", "query": query,
-                "chunks_found": len(ranked_results)})
+        # writer({"event": "rag_search_complete", "query": query,
+        #         "chunks_found": len(ranked_results)})
 
         return {
             "query":         query,
@@ -197,7 +185,7 @@ async def search_first_aid_rag(
         }
 
     except Exception as e:
-        writer({"event": "rag_search_failed", "query": query, "error": str(e)})
+        # writer({"event": "rag_search_failed", "query": query, "error": str(e)})
         return {
             "query":        query,
             "context":      "",

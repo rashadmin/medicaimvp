@@ -19,11 +19,14 @@ GET  /health
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import re
 import uuid
 from typing import AsyncGenerator
 
+import httpx
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -41,6 +44,15 @@ app.add_middleware(
 
 # in-memory session store
 sessions: dict[str, dict] = {}
+
+# ── subagent polling config (PULL model) ──────────────────────────────────
+# The rag_searcher / hospital_notifier / youtube_subagent tasks run on a
+# separate server (async_coordinator.py) as fire-and-forget background
+# tasks. There is no push channel from that server back into this one, so
+# progress/results are recovered by polling its /threads/{task_id} endpoint.
+SUBAGENT_URL       = os.getenv("SUBAGENT_URL", "http://localhost:8000")
+SUBAGENT_POLL_SECS = float(os.getenv("SUBAGENT_POLL_SECS", "1.5"))
+SUBAGENT_MAX_WAIT  = float(os.getenv("SUBAGENT_MAX_WAIT", "180"))
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -92,8 +104,8 @@ def _safe_dict(data: any) -> dict:
 def _classify_chunk(chunk: dict, session_id: str) -> tuple[str, dict] | None:
     chunk_type = chunk.get("type")
     ns         = chunk.get("ns", ())
-    data       = chunk.get("data", {})
-    data       = _safe_dict(data)
+    raw_data       = chunk.get("data", {})
+    # data       = _safe_dict(raw_data)
 
     is_subagent = any(str(s).startswith("tools:") for s in ns)
     ns_str      = " ".join(str(s) for s in ns)
@@ -103,6 +115,37 @@ def _classify_chunk(chunk: dict, session_id: str) -> tuple[str, dict] | None:
         "supervisor"
     )
 
+    
+    # "messages"-mode chunks carry (message_chunk, metadata) as a TUPLE in
+    # chunk["data"]. This must be handled before _safe_dict() ever sees it:
+    # dict() on a bare 2-tuple doesn't raise, it silently reinterprets the
+    # tuple as a single {key: value} pair (the message object becomes a
+    # dict key), which destroys token.content. That was why every assistant
+    # reply came through as an empty response — the "ai"/content branch
+    # below was unreachable once `data` had already been run through
+    # _safe_dict up top.
+    if chunk_type == "messages":
+        token   = raw_data[0] if isinstance(raw_data, tuple) else raw_data
+        content = getattr(token, "content", None)
+        t       = getattr(token, "type", "")
+ 
+        # handle Gemini content list format
+        if isinstance(content, list):
+            content = "".join(
+                c.get("text", "") if isinstance(c, dict) else str(c)
+                for c in content
+            )
+        if t in ("ai", "AIMessageChunk") and content and not getattr(token, "tool_call_chunks", None):
+            return "token", {"source": source, "text": content}
+ 
+        if getattr(token, "tool_call_chunks", None):
+            tc = token.tool_call_chunks[0]
+            if tc.get("name"):
+                return "tool_call", {"source": source, "tool": tc["name"]}
+        return None
+ 
+    data = _safe_dict(raw_data)
+    
     if chunk_type == "custom":
         # rag search events — stream silently (don't show in chat)
         event = data.get("event", "")
@@ -124,7 +167,25 @@ def _classify_chunk(chunk: dict, session_id: str) -> tuple[str, dict] | None:
                 ):
                     if msg.name == "start_async_task":
                         _handle_task_launched(msg.content, session_id)
-
+            # capture tool call ARGUMENTS. These only exist fully-formed on
+            # the AIMessage in "updates" mode (node_data here, before the
+            # "tools" node executes) — the "messages"-mode token stream only
+            # sees tool_call_chunks arriving as fragmented JSON deltas, so
+            # args can't be reliably read from there without reassembling
+            # partial JSON across chunks. This is the supervisor's own tool
+            # calls only (not subagents' — those run in a separate process).
+            if not is_subagent:
+                for msg in node_data.get("messages", []):
+                    if hasattr(msg, "type") and msg.type == "ai":
+                        tool_calls = getattr(msg, "tool_calls", None) or []
+                        if tool_calls:
+                            return "tool_call_request", {
+                                "source": source,
+                                "calls": [
+                                    {"tool": tc.get("name", ""), "args": tc.get("args", {})}
+                                    for tc in tool_calls
+                                ],
+                            }
             if node_name == "tools" and not is_subagent:
                 for msg in node_data.get("messages", []):
                     if hasattr(msg, "type") and msg.type == "tool":
@@ -141,42 +202,108 @@ def _classify_chunk(chunk: dict, session_id: str) -> tuple[str, dict] | None:
                             "content": str(msg.content)[:500],
                         }
             return "step", {"source": source, "node": node_name}
+            
+            
+    # if chunk.get("type") == "messages":
+    #     raw   = chunk.get("data", {})
+    #     token = raw[0] if isinstance(raw, tuple) else raw
+    #     content = getattr(token, "content", None)
+    #     if content:
+    #         print(f"RAW TOKEN CONTENT: {repr(content)[:200]}", flush=True)
 
-    if chunk_type == "messages":
-        raw     = data
-        token   = raw[0] if isinstance(raw, tuple) else raw
-        content = getattr(token, "content", None)
-        t       = getattr(token, "type", "")
+    
+    # if chunk_type == "messages":
+    #     raw     = data
+    #     token   = raw[0] if isinstance(raw, tuple) else raw
+    #     content = getattr(token, "content", None)
+    #     t       = getattr(token, "type", "")
 
-        # handle Gemini content list format
-        if isinstance(content, list):
-            content = "".join(
-                c.get("text", "") if isinstance(c, dict) else str(c)
-                for c in content
-            )
+    #     # handle Gemini content list format
+    #     if isinstance(content, list):
+    #         content = "".join(
+    #             c.get("text", "") if isinstance(c, dict) else str(c)
+    #             for c in content
+    #         )
+    #     if t in ("ai", "AIMessageChunk") and content and not getattr(token, "tool_call_chunks", None):
+    #         return "token", {"source": source, "text": content}
+    #     # if t == "ai" and content and not getattr(token, "tool_call_chunks", None):
+    #     #     return "token", {"source": source, "text": content}
 
-        if t == "ai" and content and not getattr(token, "tool_call_chunks", None):
-            return "token", {"source": source, "text": content}
-
-        if getattr(token, "tool_call_chunks", None):
-            tc = token.tool_call_chunks[0]
-            if tc.get("name"):
-                return "tool_call", {"source": source, "tool": tc["name"]}
+    #     if getattr(token, "tool_call_chunks", None):
+    #         tc = token.tool_call_chunks[0]
+    #         if tc.get("name"):
+    #             return "tool_call", {"source": source, "tool": tc["name"]}
 
     return None
 
 
 def _handle_task_launched(content: str, session_id: str) -> None:
-    """Extract task_id from start_async_task result and store youtube ones."""
+    """Extract task_id from start_async_task result, store it, and kick off
+    a background watcher so its progress/result is recoverable later —
+    independent of whether this SSE turn is still open."""
     try:
-        import re
         match   = re.search(r"task_id[:\s]+([a-f0-9\-]{36})", str(content))
         task_id = match.group(1) if match else None
         if task_id and session_id in sessions:
-            # we store all task_ids — frontend can poll videos
             sessions[session_id].setdefault("rag_task_ids", []).append(task_id)
+            sessions[session_id].setdefault("subagent_status", {})[task_id] = {
+                "status": "pending", "tool_calls": [], "final": "",
+            }
+            asyncio.create_task(
+                _watch_subagent_task(session_id, task_id),
+                name=f"watch-{task_id[:8]}",
+            )
     except Exception:
         pass
+
+
+async def _read_subagent_thread(task_id: str) -> dict | None:
+    """Single read of a subagent's thread state from the coordinator server.
+    Returns None on failure (caller decides whether to retry)."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{SUBAGENT_URL}/threads/{task_id}")
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception:
+        return None
+
+    msgs = data.get("values", {}).get("messages", [])
+    tool_calls, final_content = [], ""
+    for msg in msgs:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("type") == "tool":
+            tool_calls.append({
+                "name":    msg.get("name", "unknown_tool"),
+                "content": msg.get("content", ""),
+            })
+        elif msg.get("type") == "ai" and msg.get("content"):
+            final_content = msg.get("content")
+    return {"tool_calls": tool_calls, "final": final_content}
+
+
+async def _watch_subagent_task(session_id: str, task_id: str) -> None:
+    """Poll one subagent task until it produces output or times out, updating
+    sessions[session_id]['subagent_status'][task_id] as it goes. This runs
+    detached from any single /chat request — it survives the SSE stream
+    closing, so slow tasks (hospital_notifier) are still tracked and can be
+    read later via GET /session/{session_id}/subagent-status."""
+    deadline = asyncio.get_event_loop().time() + SUBAGENT_MAX_WAIT
+    while asyncio.get_event_loop().time() < deadline:
+        result = await _read_subagent_thread(task_id)
+        if result and (result["tool_calls"] or result["final"]):
+            if session_id in sessions:
+                sessions[session_id]["subagent_status"][task_id] = {
+                    "status": "complete", **result,
+                }
+            return
+        await asyncio.sleep(SUBAGENT_POLL_SECS)
+
+    if session_id in sessions:
+        sessions[session_id]["subagent_status"][task_id] = {
+            "status": "timeout", "tool_calls": [], "final": "",
+        }
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -199,6 +326,29 @@ async def _stream_chat(
 
     yield _sse("turn_started", {"session_id": session_id, "turn_type": turn_type})
 
+    # task_ids whose "complete" status we've already emitted as an SSE event
+    # in this turn — avoids re-sending the same coordinator_event on a later
+    # poll tick, since _watch_subagent_task keeps its entry in place.
+    already_emitted: set[str] = set()
+
+    def _drain_subagent_updates() -> list[tuple[str, dict]]:
+        """Best-effort, non-blocking check of subagent_status for anything
+        that finished since we last looked. This is what makes fast subagent
+        completions (e.g. a quick RAG search) show up as rag_event /
+        coordinator_event WHILE this turn's SSE connection is still open —
+        without this turn having to wait on them itself."""
+        out = []
+        for tid, st in sessions.get(session_id, {}).get("subagent_status", {}).items():
+            if tid in already_emitted or st["status"] not in ("complete", "timeout"):
+                continue
+            already_emitted.add(tid)
+            event = "rag_event" if st["status"] == "complete" else "coordinator_event"
+            out.append((event, {
+                "source": "subagent", "task_id": tid, "status": st["status"],
+                "tool_calls": st.get("tool_calls", []), "final": st.get("final", ""),
+            }))
+        return out
+
     try:
         async for chunk in agent.astream(
             agent_input,
@@ -207,19 +357,27 @@ async def _stream_chat(
             subgraphs=True,
             version="v2",
         ):
+            # flush any subagent progress the background watchers picked up
+            # since the last chunk, so it interleaves with the main stream
+            for event, payload in _drain_subagent_updates():
+                yield _sse(event, payload)
+
             classified = _classify_chunk(chunk, session_id)
-            if not classified:
-                continue
-
-            event, payload = classified
-
-            # rag_events are silent — don't send to client chat
-            # but do send so frontend can show a subtle "searching..." indicator
-            yield _sse(event, payload)
+            if classified:
+                event, payload = classified
+                yield _sse(event, payload)
 
     except Exception as exc:
         yield _sse("error", {"message": str(exc)})
         return
+
+    # final drain — catches anything that completed in the gap between the
+    # last agent chunk and here. Anything still running after this point is
+    # NOT held up on — the client should poll
+    # GET /session/{session_id}/subagent-status for the rest, since slow
+    # tasks (hospital_notifier) can easily outlive this SSE connection.
+    for event, payload in _drain_subagent_updates():
+        yield _sse(event, payload)
 
     yield _sse("done", {"session_id": session_id, "turn_type": turn_type})
 
@@ -268,11 +426,12 @@ async def chat(request: ChatRequest):
         session_id = str(uuid.uuid4())
         thread_id  = session_id
         sessions[session_id] = {
-            "thread_id":       thread_id,
-            "location":        request.location.model_dump(),
-            "patient_profile": request.patient_profile.model_dump(),
-            "rag_task_ids":    [],
+            "thread_id":        thread_id,
+            "location":         request.location.model_dump(),
+            "patient_profile":  request.patient_profile.model_dump(),
+            "rag_task_ids":     [],
             "youtube_task_ids": [],
+            "subagent_status":  {},   # task_id -> {status, tool_calls, final}
         }
     else:
         session_id = request.session_id
@@ -324,6 +483,37 @@ async def get_videos(session_id: str):
         return JSONResponse({"status": status, "videos": videos})
     except Exception as e:
         return JSONResponse({"status": "error", "videos": [], "message": str(e)})
+
+
+@app.get("/session/{session_id}/subagent-status")
+async def subagent_status(session_id: str):
+    """
+    Poll the state of every subagent task launched in this session.
+
+    This is the PULL counterpart to the SSE stream: subagents run detached
+    (via async_coordinator.py, a separate process) and can easily outlive
+    a single /chat turn's SSE connection — hospital_notifier in particular
+    may take minutes waiting on real replies. Rather than holding the SSE
+    connection open or building a webhook channel back from the coordinator
+    server, the frontend should poll this endpoint after the stream closes
+    to pick up anything that was still "pending" in the last SSE frame.
+
+    Response:
+    {
+      "session_id": "...",
+      "tasks": {
+        "<task_id>": {"status": "pending|complete|timeout",
+                       "tool_calls": [...], "final": "..."}
+      }
+    }
+    """
+    session = sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    return JSONResponse({
+        "session_id": session_id,
+        "tasks": session.get("subagent_status", {}),
+    })
 
 
 @app.get("/sessions")

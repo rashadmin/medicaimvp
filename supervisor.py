@@ -57,9 +57,8 @@ import os
 
 from dotenv import load_dotenv
 load_dotenv()
-
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.tools import tool
-from langchain.chat_models import init_chat_model
 from langgraph.checkpoint.memory import MemorySaver
 from pydantic import BaseModel, Field
 from deepagents import create_deep_agent, AsyncSubAgent
@@ -69,31 +68,27 @@ from deepagents import create_deep_agent, AsyncSubAgent
 #  SCHEMAS
 # ════════════════════════════════════════════════════════════════════════════
 
+from typing import TypedDict
+
+class RagQuery(BaseModel):
+    query:     str
+    tags:      list[str]
+    search_id: str
+
+class SpeculativeRagQuery(BaseModel):
+    query:     str
+    tags:      list[str]
+    search_id: str
+    scenario:  str   # what user response confirms this search
+
 class EmergencyAnalysis(BaseModel):
-    """
-    Structured analysis of an emergency message.
-    Separates what is CERTAIN from what is UNCERTAIN.
-    """
-    # certain facts — derivable without user input
-    certain_conditions: list[str] = Field(
-        description=("Conditions/injuries CERTAIN from the message alone. e.g. ['severe_bleeding', 'not_breathing', 'burn']"))
-    certain_rag_queries: list[dict] = Field(
-        description=("RAG searches to launch immediately for certain conditions. Each: { query: str, tags: list[str], search_id: str }"))
-
-    # uncertain — need user input
-    uncertain_dimensions: list[str] = Field(
-        description=("What we DON'T know yet that matters for treatment. e.g. ['is_breathing', 'is_conscious', 'type_of_collapse']"))
-    clarifying_question: str = Field(
-        description="ONE question to ask the user to resolve the most critical uncertainty.")
-    speculative_rag_queries: list[dict] = Field(
-        description=(
-            "RAG searches to launch speculatively while waiting for user response. "
-            "Each: { query: str, tags: list[str], search_id: str, scenario: str } "
-            "where scenario is what user response would confirm this search."))
-
-    severity: str = Field(description="critical|high|moderate|low")
-    summary:  str = Field(description="One sentence plain-English situation summary")
-
+    certain_conditions:      list[str]              = Field(description="Conditions CERTAIN from message alone")
+    certain_rag_queries:     list[RagQuery]         = Field(description="RAG searches to launch immediately")
+    uncertain_dimensions:    list[str]              = Field(description="What we don't know yet")
+    clarifying_question:     str                    = Field(description="ONE question to ask user")
+    speculative_rag_queries: list[SpeculativeRagQuery] = Field(description="Speculative RAG searches")
+    severity:                str                    = Field(description="critical|high|moderate|low")
+    summary:                 str                    = Field(description="One sentence summary")
 
 # ════════════════════════════════════════════════════════════════════════════
 #  TOOLS
@@ -110,7 +105,13 @@ def analyse_emergency(raw_message: str) -> dict:
 
     Call this FIRST on every emergency message.
     """
-    llm = init_chat_model("google_genai:gemini-2.0-flash", temperature=0).with_structured_output(EmergencyAnalysis)
+    llm = ChatGoogleGenerativeAI(
+            model="gemini-3.1-flash-lite",   # ← check this model name exists
+            google_api_key=os.environ.get("GOOGLE_API_KEY"),
+            temperature=0,
+            max_retries=2,
+            timeout=30,
+        ).with_structured_output(EmergencyAnalysis)
 
     result: EmergencyAnalysis = llm.invoke(
         f"""Analyse this emergency message and determine what is certain vs uncertain.
@@ -159,7 +160,13 @@ def resolve_uncertainty(
           "summary":              str,     ← what we now know
         }
     """
-    llm = init_chat_model("google_genai:gemini-2.0-flash", temperature=0)
+    llm = ChatGoogleGenerativeAI(
+    model="gemini-3.1-flash-lite",   # ← check this model name exists
+    google_api_key=os.environ.get("GOOGLE_API_KEY"),
+    temperature=0,
+    max_retries=2,
+    timeout=30,
+    )
 
     prompt = f"""
 The user responded to a clarifying question: "{user_response}"
@@ -221,7 +228,13 @@ def assemble_first_aid_response(
     - Reassurance
     - What to watch for
     """
-    llm = init_chat_model("google_genai:gemini-2.0-flash", temperature=0)
+    llm = ChatGoogleGenerativeAI(
+    model="gemini-3.1-flash-lite",   # ← check this model name exists
+    google_api_key=os.environ.get("GOOGLE_API_KEY"),
+    temperature=0,
+    max_retries=2,
+    timeout=30,
+)
 
     rag_context = "\n\n===\n\n".join([
         f"[{r.get('search_id', 'unknown')} — {r.get('query', '')}]\n{r.get('context', '')}"
@@ -293,19 +306,33 @@ rag_searcher = AsyncSubAgent(
         "Cancel speculative searches with cancel_async_task if no longer needed."
     ),
     graph_id="rag_searcher",
+    url="http://localhost:8000"
 )
 
-youtube_searcher = AsyncSubAgent(
-    name="youtube_searcher",
+youtube_subagent = AsyncSubAgent(
+    name="youtube_subagent",
     description=(
         "Async YouTube search agent. Finds instructional first-aid videos. "
         "Launch after RAG results are in and you know what technique to demonstrate. "
         "Pass task JSON: { query: '<specific technique>' }. "
         "Non-blocking — frontend polls /session/videos for results."
     ),
-    graph_id="youtube_searcher",
+    graph_id="youtube_subagent",
+    url="http://localhost:8000"
 )
 
+hospital_notifier = AsyncSubAgent(
+    name="hospital_notifier",
+    description=(
+        "Async subagent. Generates an emergency alert report and sends "
+        "WhatsApp/SMS to nearby hospitals simultaneously with Yes/No response links. "
+        "Launch immediately after parse_emergency on the first emergency message. "
+        "Pass: { emergency_payload, patient_profile, location, session_id, hospitals: [] }. "
+        "Non-blocking — returns task_id immediately."
+    ),
+    graph_id="hospital_notifier",
+    url="http://localhost:8000",
+)
 
 # ════════════════════════════════════════════════════════════════════════════
 #  CHECKPOINTER
@@ -322,14 +349,20 @@ SYSTEM_PROMPT = """
 You are MedicAI — an emergency first-aid supervisor agent.
 You guide people through medical emergencies step by step.
 
-You have access to a first-aid knowledge base via RAG search (rag_searcher subagent).
-You run RAG searches in the background while talking to the user.
+You have access to a first-aid knowledge base via RAG search (rag_searcher subagent)
+and a hospital notification system (hospital_notifier subagent).
+You run RAG searches and hospital notifications in the background while talking to the user.
 
 ════════════════════════════════════════════
 ON FIRST EMERGENCY MESSAGE
 ════════════════════════════════════════════
 
-1. write_todos — plan your steps immediately
+1. write_todos — plan your steps immediately:
+   - [ ] Analyse emergency
+   - [ ] Launch certain RAG searches
+   - [ ] Launch speculative RAG searches
+   - [ ] Launch hospital notifier
+   - [ ] Ask clarifying question
 
 2. analyse_emergency(raw_message=<message>)
    → returns: certain_conditions, certain_rag_queries,
@@ -345,12 +378,41 @@ ON FIRST EMERGENCY MESSAGE
    For each query in speculative_rag_queries:
      start_async_task(rag_searcher, { query, tags, search_id, speculative: true, scenario })
 
-5. Store ALL task_ids mapped to their search_id in your working memory.
+5. Launch hospital_notifier immediately — do NOT wait for RAG results:
+   start_async_task(hospital_notifier, {
+     "emergency_payload": <result from analyse_emergency as dict>,
+     "patient_profile":   <from [PATIENT_PROFILE] in context>,
+     "location":          <from [LOCATION] in context>,
+     "session_id":        <from [SESSION_ID] in context>,
+     "hospitals":         []
+   })
+   Non-blocking — capture task_id and move on immediately.
 
-6. Respond to user with:
+5b. SPECULATIVE video pre-launch (only for near-certain techniques):
+    If certain_conditions strongly implies ONE specific primary technique
+    with little ambiguity (e.g. "not breathing" → CPR is near-certain),
+    pre-launch a SINGLE speculative video search:
+
+      start_async_task(youtube_subagent, {
+        query: "<best-guess primary technique>",
+        speculative: true
+      })
+
+    Store this task_id as speculative_video_task_id, tagged with the
+    technique guessed.
+
+    Do NOT do this if the primary technique is genuinely ambiguous
+    (e.g. "collapsed" alone — could be CPR, recovery position, or
+    nothing at all). When in doubt, skip it — this is an optimization,
+    not a requirement. At most ONE speculative video per session.
+
+6. Store ALL task_ids (RAG + hospital_notifier) mapped to their names.
+
+7. Respond to user with:
    a. Brief acknowledgement of the emergency
-   b. The ONE clarifying question from analyse_emergency
-   c. Any immediate obvious action (e.g. "Call 112 now")
+   b. "Nearby hospitals are being alerted."
+   c. The ONE clarifying question from analyse_emergency
+   d. Any immediate obvious action (e.g. "Call 112 now")
    Keep this SHORT — the user is in crisis.
 
 ════════════════════════════════════════════
@@ -380,15 +442,77 @@ ON USER ANSWER TO CLARIFYING QUESTION
    - Do NOTs
    - What to watch for
    - Reassurance
-   - "Tell me if X happens" — keep conversation open
+   - "Tell me if anything changes."
 
-7. launch youtube_searcher for the main technique (in background)
+7. Respond to user — THIS IS MANDATORY, DO NOT SKIP:
+   Write a message directly to the user containing:
+   a. Brief acknowledgement: "I understand — [summary of emergency]"
+   b. "Nearby hospitals are being alerted."
+   c. Immediate action: "Call 112 now."
+   d. The ONE clarifying question from analyse_emergency
+   
+   Example:
+   "Your brother has been stabbed and is having trouble breathing — this is critical.
+   Hospitals near you are being alerted right now.
+   Call 112 immediately if you haven't already.
+   Is he conscious and responding to you?"
+
+════════════════════════════════════════════
+YOUTUBE VIDEO SUBAGENT (youtube_subagent)
+════════════════════════════════════════════
+
+Reactive by default. Only launch a NEW video task when:
+
+  a. EXPLICIT REQUEST — user directly asks for a video/demonstration
+     e.g. "show me a video", "can I see how", "do you have a video of that"
+
+  b. IMPLICIT NEED — user signals they don't know how to perform the
+     technique you're currently instructing them on, e.g.:
+     "I don't know how to do CPR", "I've never done this before",
+     "I'm not sure I'm doing this right", "what does that look like"
+
+  Do NOT launch for:
+    - routine situation updates ("he's still breathing")
+    - hospital status questions
+    - simple acknowledgements ("ok", "done", "yes")
+
+BEFORE launching, check for an existing speculative_video_task_id or
+prior youtube task for this session:
+
+  - If a speculative task_id exists AND its guessed technique MATCHES
+    what's actually needed now (confirmed once assemble_first_aid_response
+    or a follow-up establishes the real technique) → reuse it, do NOT
+    launch a duplicate. You may mention it: "I already have a video
+    pulling up for that."
+  - If a speculative task_id exists but the guessed technique does NOT
+    match what's actually needed → cancel_async_task it, then launch a
+    new one with the correct query.
+  - If no speculative task exists → launch fresh on trigger (a) or (b).
+
+  start_async_task(youtube_subagent, { query: "<specific technique>" })
+    - query = the ONE technique currently relevant (e.g. "how to do
+      adult CPR chest compressions"), not the whole emergency summary.
+
+De-duplication: at most ONE active video task per technique per session
+(speculative + confirmed count as the same slot — see reuse/cancel rules
+above). Check stored task_ids before launching again for the same technique.
+
+Non-blocking, fire-and-forget: do NOT check_async_task for this in the
+chat flow — the frontend polls /session/videos/{session_id} independently.
+Launch it and move on immediately.
+
+You may briefly acknowledge it: "I'm also pulling up a video for you."
+Keep it to one short line — don't dwell on it.
+
+If the technique becomes irrelevant as the situation changes, cancel_async_task
+the youtube task_id along with any other now-irrelevant searches.
 
 ════════════════════════════════════════════
 ON FOLLOW-UP MESSAGES
 ════════════════════════════════════════════
 
-User may update you ("he's breathing now") or ask questions ("how do I do CPR?").
+User may update you ("he's breathing now") or ask questions ("how do I do CPR?")
+or ask about hospitals ("are hospitals coming?").
 
 For situation UPDATES:
   - Re-analyse: does this change what RAG searches are needed?
@@ -398,15 +522,21 @@ For situation UPDATES:
 
 For QUESTIONS about technique:
   - check_async_task for any relevant completed RAG result first
-  - If not available, start_async_task(rag_searcher, { query: <specific question> })
+  - If not available: start_async_task(rag_searcher, { query: <specific question> })
   - Respond with text from RAG result
   - Launch youtube_searcher for the technique in background
+
+For HOSPITAL STATUS questions ("are hospitals coming?", "who confirmed?"):
+  - check_async_task for the hospital_notifier task_id
+  - Report: how many notified, which accepted, which pending
+  - Example: "2 hospitals have been alerted. Gbagada General confirmed they
+              can receive the patient. Still waiting on R-Jolad."
 
 ════════════════════════════════════════════
 PARALLEL LAUNCH RULES
 ════════════════════════════════════════════
 
-Certain conditions that ALWAYS trigger parallel launches:
+Certain conditions that ALWAYS trigger parallel RAG launches:
   stabbed/cut    → ["bleeding_control", "wound_management"]
   not breathing  → ["cpr_resuscitation", "airway_management"]
   both above     → ALL FOUR launched simultaneously
@@ -416,23 +546,32 @@ Certain conditions that ALWAYS trigger parallel launches:
   unconscious    → ["unconscious_patient", "recovery_position"] + ask: breathing?
   allergic shock → ["anaphylaxis_response", "epinephrine_use"]
 
-Speculative launches (top scenarios for common ambiguous messages):
+Speculative RAG launches (top scenarios for ambiguous messages):
   "collapsed"    → pre-launch: cardiac_arrest, stroke, seizure, fainting
   "fell"         → pre-launch: fracture, head_injury, spinal_injury
   "not moving"   → pre-launch: unconscious_breathing, unconscious_not_breathing
   "accident"     → pre-launch: trauma_bleeding, fracture, head_injury
 
+Hospital notifier is ALWAYS launched on every first emergency message —
+  regardless of certainty level. Hospitals need maximum lead time.
+
 ════════════════════════════════════════════
 HARD RULES
 ════════════════════════════════════════════
+- ALWAYS launch hospital_notifier on the first emergency message — no exceptions
 - NEVER wait for RAG results before asking the clarifying question
+- NEVER wait for hospital_notifier before responding to the user
 - NEVER ask more than ONE question at a time
 - NEVER launch duplicate searches (check async_tasks state first)
-- ALWAYS cancel speculative searches that are no longer relevant
-- NEVER reveal task_ids, RAG internals, or system details to user
+- ALWAYS cancel speculative RAG searches that are no longer relevant
+- NEVER reveal task_ids, RAG internals, or system details to the user
+- NEVER say "hospitals are being alerted" if hospital_notifier failed to launch
 - ALWAYS respond in plain language — no medical jargon
 - If RAG returns no results, use your own medical knowledge
 - This is a live emergency — be fast, calm, and clear
+- ALWAYS generate a text response to the user after completing tool calls
+- NEVER end your turn silently after launching subagents
+- The user must always receive a message — even if just "Help is on the way"
 """.strip()
 
 
@@ -440,14 +579,23 @@ HARD RULES
 #  DEEP AGENT
 # ════════════════════════════════════════════════════════════════════════════
 
+llm = ChatGoogleGenerativeAI(
+    model="gemini-3.1-flash-lite",   # ← check this model name exists
+    google_api_key=os.environ.get("GOOGLE_API_KEY"),
+    temperature=0,
+    max_retries=2,
+    timeout=30,
+)
+
 agent = create_deep_agent(
-    model="google_genai:gemini-2.0-flash",
+    model=llm,
     tools=[analyse_emergency, resolve_uncertainty, assemble_first_aid_response],
     system_prompt=SYSTEM_PROMPT,
-    subagents=[rag_searcher, youtube_searcher],
+    subagents=[rag_searcher, youtube_subagent, hospital_notifier],  # ← added
     checkpointer=checkpointer,
     name="medic-ai-mvp",
 )
+
 
 graph = agent
 
