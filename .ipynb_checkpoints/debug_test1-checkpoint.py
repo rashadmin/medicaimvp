@@ -481,6 +481,7 @@ def _print_event(event_type: str, data: dict) -> None:
         "turn_started":     "▶",
         "tool_call":        "🔧",
         "tool_call_request": "📝",
+        "retrying":         "🔁",
         "subagent_complete": "📦",
         "rag_event":        "🔍",
         "coordinator_event": "📡",
@@ -506,6 +507,8 @@ def _print_event(event_type: str, data: dict) -> None:
     elif event_type == "coordinator_event":
         event = data.get("event", "")
         print(f"\n  {icon} coordinator: {event}")
+    elif event_type == "retrying":
+        print(f"\n  {icon} retrying (attempt {data.get('attempt')}/{data.get('max_attempts')}) — {data.get('message', '')}")
     elif event_type in ("done", "error", "ready"):
         turn_type = data.get("turn_type", "")
         print(f"\n  {icon} {event_type.upper()} {turn_type}")

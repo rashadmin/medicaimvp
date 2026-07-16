@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import uuid
@@ -36,6 +37,8 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from supervisor import agent, make_config, build_input, checkpointer
+
+logger = logging.getLogger("medicai.api")
 
 app = FastAPI(title="MedicAI MVP", version="1.0.0")
 app.add_middleware(
@@ -53,6 +56,43 @@ sessions: dict[str, dict] = {}
 SUBAGENT_URL       = os.getenv("SUBAGENT_URL", "http://localhost:8000")
 SUBAGENT_POLL_SECS = float(os.getenv("SUBAGENT_POLL_SECS", "1.5"))
 SUBAGENT_MAX_WAIT  = float(os.getenv("SUBAGENT_MAX_WAIT", "180"))
+
+# ── model call retry config ────────────────────────────────────────────────
+# Retries only cover the SUPERVISOR's own model calls (agent.astream()), and
+# only while no "token" text has reached the client yet for this turn — once
+# any text has been streamed, retrying from scratch would duplicate/garble
+# the response, so a failure past that point is surfaced as a terminal error
+# instead. Subagents are a separate process with their own retry surface
+# (currently: silently retried by _watch_subagent_task's poll loop, which
+# treats any read failure as "not ready yet" and tries again next tick).
+MAX_MODEL_RETRIES     = int(os.getenv("MAX_MODEL_RETRIES", "2"))
+MODEL_RETRY_BASE_DELAY = float(os.getenv("MODEL_RETRY_BASE_DELAY", "1.5"))
+
+
+def _classify_error(exc: Exception) -> tuple[bool, str]:
+    """Decide whether an exception from agent.astream() is worth retrying,
+    and produce a message that's safe to send to the client.
+
+    Provider exceptions (esp. Gemini 429s) come back as a giant raw JSON
+    blob — quota IDs, internal doc links, retry-delay hints. That must never
+    reach the end user directly (it did, previously: a 429 payload ended up
+    inside the assistant's visible response). Log the full exception
+    server-side; only ever send the classified, generic message."""
+    text = str(exc)
+    logger.warning("agent.astream error: %s", text[:2000])
+
+    if "RESOURCE_EXHAUSTED" in text or "429" in text or "Too Many Requests" in text:
+        return True, "The AI service is temporarily rate-limited."
+    if (
+        isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout))
+        or "Network is unreachable" in text
+        or "Cannot connect to host" in text
+    ):
+        return True, "Lost connection to the AI service."
+    if "503" in text or "UNAVAILABLE" in text or "overloaded" in text.lower():
+        return True, "The AI service is temporarily overloaded."
+    return False, "Something went wrong while processing your message."
+
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -104,8 +144,7 @@ def _safe_dict(data: any) -> dict:
 def _classify_chunk(chunk: dict, session_id: str) -> tuple[str, dict] | None:
     chunk_type = chunk.get("type")
     ns         = chunk.get("ns", ())
-    raw_data       = chunk.get("data", {})
-    # data       = _safe_dict(raw_data)
+    raw_data   = chunk.get("data", {})
 
     is_subagent = any(str(s).startswith("tools:") for s in ns)
     ns_str      = " ".join(str(s) for s in ns)
@@ -115,7 +154,6 @@ def _classify_chunk(chunk: dict, session_id: str) -> tuple[str, dict] | None:
         "supervisor"
     )
 
-    
     # "messages"-mode chunks carry (message_chunk, metadata) as a TUPLE in
     # chunk["data"]. This must be handled before _safe_dict() ever sees it:
     # dict() on a bare 2-tuple doesn't raise, it silently reinterprets the
@@ -128,7 +166,7 @@ def _classify_chunk(chunk: dict, session_id: str) -> tuple[str, dict] | None:
         token   = raw_data[0] if isinstance(raw_data, tuple) else raw_data
         content = getattr(token, "content", None)
         t       = getattr(token, "type", "")
- 
+
         # handle Gemini content list format
         if isinstance(content, list):
             content = "".join(
@@ -137,15 +175,15 @@ def _classify_chunk(chunk: dict, session_id: str) -> tuple[str, dict] | None:
             )
         if t in ("ai", "AIMessageChunk") and content and not getattr(token, "tool_call_chunks", None):
             return "token", {"source": source, "text": content}
- 
+
         if getattr(token, "tool_call_chunks", None):
             tc = token.tool_call_chunks[0]
             if tc.get("name"):
                 return "tool_call", {"source": source, "tool": tc["name"]}
         return None
- 
+
     data = _safe_dict(raw_data)
-    
+
     if chunk_type == "custom":
         # rag search events — stream silently (don't show in chat)
         event = data.get("event", "")
@@ -167,6 +205,7 @@ def _classify_chunk(chunk: dict, session_id: str) -> tuple[str, dict] | None:
                 ):
                     if msg.name == "start_async_task":
                         _handle_task_launched(msg.content, session_id)
+
             # capture tool call ARGUMENTS. These only exist fully-formed on
             # the AIMessage in "updates" mode (node_data here, before the
             # "tools" node executes) — the "messages"-mode token stream only
@@ -186,6 +225,7 @@ def _classify_chunk(chunk: dict, session_id: str) -> tuple[str, dict] | None:
                                     for tc in tool_calls
                                 ],
                             }
+
             if node_name == "tools" and not is_subagent:
                 for msg in node_data.get("messages", []):
                     if hasattr(msg, "type") and msg.type == "tool":
@@ -204,36 +244,6 @@ def _classify_chunk(chunk: dict, session_id: str) -> tuple[str, dict] | None:
             return "step", {"source": source, "node": node_name}
             
             
-    # if chunk.get("type") == "messages":
-    #     raw   = chunk.get("data", {})
-    #     token = raw[0] if isinstance(raw, tuple) else raw
-    #     content = getattr(token, "content", None)
-    #     if content:
-    #         print(f"RAW TOKEN CONTENT: {repr(content)[:200]}", flush=True)
-
-    
-    # if chunk_type == "messages":
-    #     raw     = data
-    #     token   = raw[0] if isinstance(raw, tuple) else raw
-    #     content = getattr(token, "content", None)
-    #     t       = getattr(token, "type", "")
-
-    #     # handle Gemini content list format
-    #     if isinstance(content, list):
-    #         content = "".join(
-    #             c.get("text", "") if isinstance(c, dict) else str(c)
-    #             for c in content
-    #         )
-    #     if t in ("ai", "AIMessageChunk") and content and not getattr(token, "tool_call_chunks", None):
-    #         return "token", {"source": source, "text": content}
-    #     # if t == "ai" and content and not getattr(token, "tool_call_chunks", None):
-    #     #     return "token", {"source": source, "text": content}
-
-    #     if getattr(token, "tool_call_chunks", None):
-    #         tc = token.tool_call_chunks[0]
-    #         if tc.get("name"):
-    #             return "tool_call", {"source": source, "tool": tc["name"]}
-
     return None
 
 
@@ -349,27 +359,56 @@ async def _stream_chat(
             }))
         return out
 
-    try:
-        async for chunk in agent.astream(
-            agent_input,
-            config=config,
-            stream_mode=["updates", "messages", "custom"],
-            subgraphs=True,
-            version="v2",
-        ):
-            # flush any subagent progress the background watchers picked up
-            # since the last chunk, so it interleaves with the main stream
-            for event, payload in _drain_subagent_updates():
-                yield _sse(event, payload)
+    tokens_sent = False
+    attempt     = 0
+    while True:
+        try:
+            # First attempt runs the turn normally. Retries resume from the
+            # checkpointer's last saved state (input=None) instead of
+            # replaying agent_input — replaying would re-run every tool call
+            # already made this turn (write_todos, start_async_task,
+            # hospital notifications, ...), which for a live medical-alert
+            # flow could mean firing a duplicate hospital notification.
+            # Resuming only re-executes whatever step the graph hadn't
+            # completed yet when it failed.
+            turn_input = agent_input if attempt == 0 else None
+            async for chunk in agent.astream(
+                turn_input,
+                config=config,
+                stream_mode=["updates", "messages", "custom"],
+                subgraphs=True,
+                version="v2",
+            ):
+                # flush any subagent progress the background watchers picked
+                # up since the last chunk, so it interleaves with the main
+                # stream
+                for event, payload in _drain_subagent_updates():
+                    yield _sse(event, payload)
 
-            classified = _classify_chunk(chunk, session_id)
-            if classified:
-                event, payload = classified
-                yield _sse(event, payload)
+                classified = _classify_chunk(chunk, session_id)
+                if classified:
+                    event, payload = classified
+                    if event == "token":
+                        tokens_sent = True
+                    yield _sse(event, payload)
+            break  # completed without error
 
-    except Exception as exc:
-        yield _sse("error", {"message": str(exc)})
-        return
+        except Exception as exc:
+            is_retryable, safe_message = _classify_error(exc)
+            if is_retryable and not tokens_sent and attempt < MAX_MODEL_RETRIES:
+                attempt += 1
+                delay = MODEL_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                yield _sse("retrying", {
+                    "attempt": attempt, "max_attempts": MAX_MODEL_RETRIES,
+                    "message": safe_message, "delay_secs": delay,
+                })
+                await asyncio.sleep(delay)
+                continue
+            # either not retryable, retries exhausted, or we already
+            # streamed partial text (retrying now would duplicate it) —
+            # surface a clean terminal error and stop.
+            yield _sse("error", {"message": safe_message, "retryable": is_retryable})
+            return
 
     # final drain — catches anything that completed in the gap between the
     # last agent chunk and here. Anything still running after this point is
@@ -410,13 +449,17 @@ async def chat(request: ChatRequest):
     SSE events:
       turn_started      — { session_id, turn_type }
       step              — agent node executing
-      tool_call         — tool being called
+      tool_call         — tool being called (name only, streamed early)
+      tool_call_request — tool being called, with full args (supervisor's own tools only)
       rag_event         — RAG search started/complete (silent progress)
-      subagent_complete — RAG result received
+      subagent_complete — supervisor's own tool result (not RAG/hospital/youtube)
       token             — agent response text → stream to chat
       videos_incoming   — YouTube results being fetched
+      retrying          — a transient model error is being retried
+                           { attempt, max_attempts, message, delay_secs }
       done              — { session_id, turn_type }
-      error             — something failed
+      error             — terminal failure, safe to show the user
+                           { message, retryable }
     """
     is_new = False
 
