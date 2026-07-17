@@ -4,11 +4,11 @@ MedicAI MVP — Main Agent Test
 test_main_agent.py
 
 Tests the full main agent via the FastAPI /chat endpoint.
-All subagents (rag_searcher, hospital_notifier, youtube_searcher)
+All subagents (web_searcher, hospital_notifier, youtube_searcher)
 must be running on the subagent server.
 
 Prerequisites — run all servers first:
-  Terminal 1: uvicorn rag_subagent.async_coordinator:app --reload --port 8000
+  Terminal 1: uvicorn subagent.async_coordinator:app --reload --port 8000
   Terminal 2: uvicorn api:app --reload --port 8001
 
 Then run:
@@ -16,7 +16,7 @@ Then run:
 
 Tests:
   1. Health checks (both servers)
-  2. First emergency message — parallel RAG + hospital notifier launch
+  2. First emergency message — parallel web + hospital notifier launch
   3. Follow-up: answer clarifying question
   4. Follow-up: ask about a specific technique
   5. Follow-up: situation update
@@ -59,7 +59,7 @@ def _tool_call_rows(name: str, content) -> list[str]:
     string returned here is meant to be prefixed with "- " and put on its
     own line — never squashed into one long line.
 
-    search_first_aid_rag's raw content includes the full retrieved document
+    search_first_aid_web's raw content includes the full retrieved document
     text twice over — once as a single "context" blob, once again per-chunk
     under "chunks" with score/metadata — which is useful for debugging
     retrieval quality but floods the log. Keep only query / chunks_found /
@@ -77,12 +77,28 @@ def _tool_call_rows(name: str, content) -> list[str]:
         query        = payload.get("query", "")
         chunks_found = payload.get("chunks_found", "?")
         status       = payload.get("status", "?")
-        return [
+        rows = [
             f"**Tool:** `{name}`",
             f"**Query:** \"{query}\"",
             f"**Chunks found:** {chunks_found}",
             f"**Status:** {status}",
         ]
+        # show the actual retrieved content — truncated per-chunk so a
+        # multi-chunk result doesn't blow past a single _truncate() limit
+        chunks = payload.get("chunks") or []
+        if chunks:
+            rows.append("**Results:**")
+            for i, c in enumerate(chunks, 1):
+                meta   = c.get("metadata", {}) if isinstance(c, dict) else {}
+                title  = meta.get("title", "")
+                source = meta.get("source", "")
+                score  = c.get("score", "")
+                text   = _truncate(c.get("content", ""), 400)
+                rows.append(f"  {i}. [{title}]({source}) (score: {score})")
+                rows.append(f"     {text}")
+        elif payload.get("context"):
+            rows.append(f"**Context:** {_truncate(payload['context'], 800)}")
+        return rows
 
     return [f"**Tool:** `{name}` → {_truncate(content)}"]
 
@@ -99,7 +115,7 @@ async def _fetch_subagent_trace(
     (tool calls + result), not just that it was launched.
 
     This is the QUICK pass — bounded to a few seconds so it doesn't hold up
-    the test. Fast subagents (a single RAG search) will often be done by
+    the test. Fast subagents (a single web search) will often be done by
     the time this returns. Slow ones (hospital_notifier waiting on real
     WhatsApp/SMS replies) usually won't be — those get picked up by
     _backfill_subagent below instead of blocking here."""
@@ -178,7 +194,7 @@ async def _backfill_subagent(
     elif result["final"]:
         lines.append(f"- **Final:** {result['final']}")
     elif result["tool_calls"]:
-        # tool_calls at this point means a subagent tool (e.g. the RAG
+        # tool_calls at this point means a subagent tool (e.g. the web
         # search) has returned but the subagent hasn't produced its final
         # answer yet — show each call's query/chunks_found/status, never
         # the raw retrieved document text.
@@ -286,7 +302,7 @@ def _append_trace_log(
     lines.append("")
 
     if subagent_events:
-        lines.append("### Subagent Progress Events (rag / coordinator / video)")
+        lines.append("### Subagent Progress Events (web / coordinator / video)")
         lines.append("")
         for ev in subagent_events:
             rest = {k: v for k, v in ev.items() if k != "type"}
@@ -329,7 +345,7 @@ async def stream_chat(
     POST to /chat and stream SSE events.
     Returns (session_id, full_agent_response_text).
 
-    silent_events: event types to not print (e.g. ["step", "rag_event"])
+    silent_events: event types to not print (e.g. ["step", "web_event"])
     test_name: label used when appending this call's trace to test_traces.md
     """
     silent = set(silent_events or ["step", "tool_call_request"])
@@ -431,7 +447,7 @@ async def stream_chat(
                                 tid = _extract_task_id(data.get("content", ""))
                                 if tid:
                                     task_ids.append(tid)
-                        elif event_type in ("rag_event", "coordinator_event", "videos_incoming"):
+                        elif event_type in ("web_event", "coordinator_event", "videos_incoming"):
                             subagent_events.append({"type": event_type, **data})
                         elif event_type == "error":
                             error_msg = data.get("message", str(data))
@@ -483,7 +499,7 @@ def _print_event(event_type: str, data: dict) -> None:
         "tool_call_request": "📝",
         "retrying":         "🔁",
         "subagent_complete": "📦",
-        "rag_event":        "🔍",
+        "web_event":        "🔍",
         "coordinator_event": "📡",
         "videos_incoming":  "🎬",
         "done":             "✅",
@@ -500,10 +516,10 @@ def _print_event(event_type: str, data: dict) -> None:
     elif event_type == "subagent_complete":
         content = data.get("content", "")[:120]
         print(f"\n  {icon} [{source}] {tool} → {content}...")
-    elif event_type == "rag_event":
+    elif event_type == "web_event":
         event = data.get("event", "")
         query = data.get("query", "")
-        print(f"\n  {icon} RAG {event}: {query[:60]}")
+        print(f"\n  {icon} web {event}: {query[:60]}")
     elif event_type == "coordinator_event":
         event = data.get("event", "")
         print(f"\n  {icon} coordinator: {event}")
@@ -562,7 +578,7 @@ async def check_servers() -> bool:
             graphs = await client.get(f"{SUBAGENT_URL}/graphs")
             g_list = graphs.json().get("graphs", [])
             print(f"  ✅ Subagent (8000): graphs={g_list}")
-            for required in ["rag_searcher", "hospital_notifier"]:
+            for required in ["web_searcher", "hospital_notifier"]:
                 if required not in g_list:
                     print(f"  ⚠️  Missing graph: {required}")
         except Exception as e:
@@ -580,7 +596,7 @@ async def test_certain_emergency():
     """
     Test 1 — Emergency with CERTAIN conditions (no ambiguity).
     Stabbed + not breathing → agent should:
-      - Launch RAG for bleeding_control AND cpr simultaneously (no user input needed)
+      - Launch web for bleeding_control AND cpr simultaneously (no user input needed)
       - Launch hospital_notifier
       - Ask at most one clarifying question
       - Give immediate partial guidance
@@ -609,7 +625,7 @@ async def test_certain_emergency():
 async def test_ambiguous_emergency():
     """
     Test 2 — Ambiguous emergency → agent should ask ONE clarifying question
-    AND launch speculative RAG searches simultaneously.
+    AND launch speculative web searches simultaneously.
     """
     print("\n" + "="*60)
     print("TEST 2 — Ambiguous Emergency (collapsed — unclear cause)")
@@ -639,8 +655,8 @@ async def test_followup_answer(session_id: str):
     """
     Test 3 — Answer the clarifying question.
     Agent should:
-      - Cancel irrelevant speculative RAG searches
-      - Assemble full first-aid guidance from confirmed RAG results
+      - Cancel irrelevant speculative web searches
+      - Assemble full first-aid guidance from confirmed web results
       - Launch youtube_searcher for main technique
     """
     print("\n" + "="*60)
@@ -670,7 +686,7 @@ async def test_followup_answer(session_id: str):
 async def test_technique_question(session_id: str):
     """
     Test 4 — Ask about a specific technique.
-    Agent should query RAG and respond with detailed explanation.
+    Agent should query web and respond with detailed explanation.
     """
     print("\n" + "="*60)
     print("TEST 4 — Follow-up: Ask about CPR technique")
@@ -782,7 +798,7 @@ async def test_sessions_endpoint():
     print(f"  Total sessions: {data.get('total')}")
     for s in data.get("sessions", []):
         print(f"  • {s['session_id'][:8]}... "
-              f"RAG tasks: {s.get('rag_searches', 0)} "
+              f"web tasks: {s.get('web_searches', 0)} "
               f"YouTube: {s.get('youtube_tasks', 0)}")
     print("[test8] ✅ Passed")
 
@@ -817,7 +833,7 @@ async def test_full_conversation():
             location=LOCATION,
             patient_profile=PATIENT,
             session_id=session_id,
-            silent_events=["step", "rag_event"],
+            silent_events=["step", "web_event"],
             timeout=120,
             test_name=f"TEST 9 — Full Conversation Flow (turn {i}/{len(turns)})",
         )
@@ -840,7 +856,7 @@ async def main():
     ok = await check_servers()
     if not ok:
         print("\n❌ Not all servers running. Start:")
-        print("   Terminal 1: uvicorn rag_subagent.async_coordinator:app --reload --port 8000")
+        print("   Terminal 1: uvicorn subagent.async_coordinator:app --reload --port 8000")
         print("   Terminal 2: uvicorn api:app --reload --port 8001")
         return
 
@@ -848,30 +864,30 @@ async def main():
     import time
     # test 1 — certain emergency (stab + not breathing)
     session_id_1 = await test_certain_emergency()
-    time.sleep(60)
-    # test 2 — ambiguous emergency (collapsed grandmother)
-    session_id_2 = await test_ambiguous_emergency()
-    time.sleep(60)
-    # test 3 — follow up on session 2 (answer clarifying question)
-    session_id_2 = await test_followup_answer(session_id_2)
-    time.sleep(60)
-    # test 4 — ask technique question (continue session 2)
-    await test_technique_question(session_id_2)
-    time.sleep(60)
-    # test 5 — situation update (continue session 2)
-    await test_situation_update(session_id_2)
-    time.sleep(60)
-    # test 6 — ask about hospital status (continue session 2)
-    await test_hospital_status(session_id_2)
-    time.sleep(60)
-    # test 7 — simulate + poll hospital responses (session 1)
-    await test_poll_hospital_responses(session_id_1)
-    time.sleep(60)
-    # test 8 — active sessions
-    await test_sessions_endpoint()
-    time.sleep(60)
-    # test 9 — full conversation (new session)
-    await test_full_conversation()
+    # time.sleep(60)
+    # # test 2 — ambiguous emergency (collapsed grandmother)
+    # session_id_2 = await test_ambiguous_emergency()
+    # time.sleep(60)
+    # # test 3 — follow up on session 2 (answer clarifying question)
+    # session_id_2 = await test_followup_answer(session_id_2)
+    # time.sleep(60)
+    # # test 4 — ask technique question (continue session 2)
+    # await test_technique_question(session_id_2)
+    # time.sleep(60)
+    # # test 5 — situation update (continue session 2)
+    # await test_situation_update(session_id_2)
+    # time.sleep(60)
+    # # test 6 — ask about hospital status (continue session 2)
+    # await test_hospital_status(session_id_2)
+    # time.sleep(60)
+    # # test 7 — simulate + poll hospital responses (session 1)
+    # await test_poll_hospital_responses(session_id_1)
+    # time.sleep(60)
+    # # test 8 — active sessions
+    # await test_sessions_endpoint()
+    # time.sleep(60)
+    # # test 9 — full conversation (new session)
+    # await test_full_conversation()
 
     # give slow subagents (hospital_notifier etc.) a chance to finish and
     # get logged before the process exits

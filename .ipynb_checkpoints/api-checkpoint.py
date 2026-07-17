@@ -4,7 +4,7 @@ MedicAI MVP — FastAPI
 api.py
 
 Single endpoint for all conversation turns.
-The agent handles everything — triage, RAG, clarification, guidance.
+The agent handles everything — triage, web, clarification, guidance.
 
 POST /chat
   Body: { session_id, message, location, patient_profile }
@@ -49,7 +49,7 @@ app.add_middleware(
 sessions: dict[str, dict] = {}
 
 # ── subagent polling config (PULL model) ──────────────────────────────────
-# The rag_searcher / hospital_notifier / youtube_subagent tasks run on a
+# The web_searcher / hospital_notifier / youtube_subagent tasks run on a
 # separate server (async_coordinator.py) as fire-and-forget background
 # tasks. There is no push channel from that server back into this one, so
 # progress/results are recovered by polling its /threads/{task_id} endpoint.
@@ -129,6 +129,18 @@ def _sse(event: str, data: dict | str) -> str:
     return f"event: {event}\ndata: {payload}\n\n"
 
 
+def _safe_json_loads(text: str) -> dict | None:
+    """Best-effort JSON parse of a tool's raw content. Returns None rather
+    than raising — callers fall back to the generic subagent_complete
+    logging path when this fails, so a malformed/partial payload never
+    breaks the stream."""
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
 def _safe_dict(data: any) -> dict:
     """Convert Overwrite or any non-dict to plain dict safely."""
     if data is None:
@@ -141,7 +153,7 @@ def _safe_dict(data: any) -> dict:
         return {}
 
 
-def _classify_chunk(chunk: dict, session_id: str) -> tuple[str, dict] | None:
+def _classify_chunk(chunk: dict, session_id: str, message_state: dict) -> tuple[str, dict] | None:
     chunk_type = chunk.get("type")
     ns         = chunk.get("ns", ())
     raw_data   = chunk.get("data", {})
@@ -149,7 +161,7 @@ def _classify_chunk(chunk: dict, session_id: str) -> tuple[str, dict] | None:
     is_subagent = any(str(s).startswith("tools:") for s in ns)
     ns_str      = " ".join(str(s) for s in ns)
     source      = (
-        "rag_searcher"  if "rag_searcher"  in ns_str else
+        "web_searcher"  if "web_searcher"  in ns_str else
         "youtube"       if "youtube"       in ns_str else
         "supervisor"
     )
@@ -174,6 +186,31 @@ def _classify_chunk(chunk: dict, session_id: str) -> tuple[str, dict] | None:
                 for c in content
             )
         if t in ("ai", "AIMessageChunk") and content and not getattr(token, "tool_call_chunks", None):
+            # Some tools (e.g. analyse_emergency, assemble_first_aid_response)
+            # apparently run their own nested LLM call using the same
+            # config/callback context as the supervisor's own generation —
+            # so their structured output streams through THIS SAME
+            # "messages" channel, indistinguishable from real user-facing
+            # text at the chunk level (no tool_call_chunks on either).
+            # Observed in two shapes so far: raw JSON ("{...}") and JSON
+            # wrapped in a markdown code fence ("```json\n{...}\n```").
+            # We buffer by message id and check once we have enough
+            # leading content to tell: a real reply is always prose. This
+            # is a heuristic stopgap — the correct fix is upstream, tagging
+            # /isolating that nested call so it never reaches this stream.
+            msg_id = getattr(token, "id", None) or "unknown"
+            state  = message_state.setdefault(msg_id, {"mode": None, "buffer": ""})
+            state["buffer"] += content
+
+            if state["mode"] is None:
+                stripped = state["buffer"].lstrip()
+                if not stripped:
+                    return None  # nothing decisive yet, wait for next chunk
+                looks_like_json = stripped[0] == "{" or stripped.startswith("```json")
+                state["mode"] = "internal_json" if looks_like_json else "text"
+
+            if state["mode"] == "internal_json":
+                return "internal_output", {"source": source, "text": content}
             return "token", {"source": source, "text": content}
 
         if getattr(token, "tool_call_chunks", None):
@@ -185,10 +222,10 @@ def _classify_chunk(chunk: dict, session_id: str) -> tuple[str, dict] | None:
     data = _safe_dict(raw_data)
 
     if chunk_type == "custom":
-        # rag search events — stream silently (don't show in chat)
+        # web search events — stream silently (don't show in chat)
         event = data.get("event", "")
-        if event in ("rag_search_started", "rag_search_complete"):
-            return "rag_event", {"source": source, **data}
+        if event in ("web_search_started", "web_search_complete"):
+            return "web_event", {"source": source, **data}
         return "coordinator_event", {"source": source, **data}
 
     if chunk_type == "updates":
@@ -230,16 +267,53 @@ def _classify_chunk(chunk: dict, session_id: str) -> tuple[str, dict] | None:
                 for msg in node_data.get("messages", []):
                     if hasattr(msg, "type") and msg.type == "tool":
                         tool_name = getattr(msg, "name", "")
-                        # don't expose RAG internals in chat
-                        if tool_name in ("search_first_aid_rag",):
-                            return "rag_event", {
-                                "source": "rag_searcher",
+                        content   = getattr(msg, "content", "")
+                        # don't expose web internals in chat
+                        if tool_name in ("search_first_aid_web",):
+                            return "web_event", {
+                                "source": "web_searcher",
                                 "tool":   tool_name,
                             }
+
+                        # analyse_emergency's clarifying_question is already
+                        # a clean, isolated string — surface it as its own
+                        # event so the frontend can render a distinct
+                        # "needs a reply" UI instead of parsing prose for a
+                        # question mark. Only fires when the field is
+                        # actually populated (e.g. not on resolve_uncertainty
+                        # follow-up turns, which don't have this field) —
+                        # falls through to the generic path otherwise.
+                        if tool_name == "analyse_emergency":
+                            parsed   = _safe_json_loads(content)
+                            question = parsed.get("clarifying_question") if parsed else None
+                            if question:
+                                return "question", {"source": source, "text": question}
+
+                        # assemble_first_aid_response already returns fully
+                        # structured guidance — send it straight through as
+                        # its own event instead of letting the model
+                        # re-narrate the same fields as prose (which is also
+                        # where the JSON/code-fence leaks upstream came
+                        # from). Frontend maps each field to its own visual
+                        # treatment: numbered steps, a red "do not" box, an
+                        # amber "watch for" box, a muted reassurance line,
+                        # and a follow-up prompt button.
+                        if tool_name == "assemble_first_aid_response":
+                            parsed = _safe_json_loads(content)
+                            if parsed:
+                                return "guidance", {
+                                    "source":            source,
+                                    "priority_steps":    parsed.get("priority_steps", []),
+                                    "do_not":            parsed.get("do_not", []),
+                                    "watch_for":         parsed.get("watch_for", []),
+                                    "reassurance":       parsed.get("reassurance", ""),
+                                    "when_to_update_me": parsed.get("when_to_update_me", ""),
+                                }
+
                         return "subagent_complete", {
                             "source":  source,
                             "tool":    tool_name,
-                            "content": str(msg.content)[:500],
+                            "content": str(content)[:500],
                         }
             return "step", {"source": source, "node": node_name}
             
@@ -255,7 +329,7 @@ def _handle_task_launched(content: str, session_id: str) -> None:
         match   = re.search(r"task_id[:\s]+([a-f0-9\-]{36})", str(content))
         task_id = match.group(1) if match else None
         if task_id and session_id in sessions:
-            sessions[session_id].setdefault("rag_task_ids", []).append(task_id)
+            sessions[session_id].setdefault("web_task_ids", []).append(task_id)
             sessions[session_id].setdefault("subagent_status", {})[task_id] = {
                 "status": "pending", "tool_calls": [], "final": "",
             }
@@ -344,7 +418,7 @@ async def _stream_chat(
     def _drain_subagent_updates() -> list[tuple[str, dict]]:
         """Best-effort, non-blocking check of subagent_status for anything
         that finished since we last looked. This is what makes fast subagent
-        completions (e.g. a quick RAG search) show up as rag_event /
+        completions (e.g. a quick web search) show up as web_event /
         coordinator_event WHILE this turn's SSE connection is still open —
         without this turn having to wait on them itself."""
         out = []
@@ -352,12 +426,24 @@ async def _stream_chat(
             if tid in already_emitted or st["status"] not in ("complete", "timeout"):
                 continue
             already_emitted.add(tid)
-            event = "rag_event" if st["status"] == "complete" else "coordinator_event"
+            event = "web_event" if st["status"] == "complete" else "coordinator_event"
             out.append((event, {
                 "source": "subagent", "task_id": tid, "status": st["status"],
                 "tool_calls": st.get("tool_calls", []), "final": st.get("final", ""),
             }))
         return out
+
+    # everything that ISN'T the user-facing response text gets collected
+    # here instead of streamed live — tool_call, tool_call_request,
+    # web_event, subagent_complete, step, coordinator_event all land in
+    # this list and go out as a single batched event, not one SSE frame
+    # each. Only "token" streams live, since that's the actual answer.
+    activity_log: list[dict] = []
+
+    # tracks, per streamed-message id, whether that generation turned out to
+    # be real user-facing text or a tool's internal JSON output leaking
+    # through the same channel — see _classify_chunk for why this exists
+    message_state: dict = {}
 
     tokens_sent = False
     attempt     = 0
@@ -379,18 +465,27 @@ async def _stream_chat(
                 subgraphs=True,
                 version="v2",
             ):
-                # flush any subagent progress the background watchers picked
-                # up since the last chunk, so it interleaves with the main
-                # stream
+                # subagent progress picked up since the last chunk — queue
+                # it instead of yielding live
                 for event, payload in _drain_subagent_updates():
-                    yield _sse(event, payload)
+                    activity_log.append({"event": event, **payload})
 
-                classified = _classify_chunk(chunk, session_id)
+                classified = _classify_chunk(chunk, session_id, message_state)
                 if classified:
                     event, payload = classified
                     if event == "token":
                         tokens_sent = True
-                    yield _sse(event, payload)
+                        yield _sse(event, payload)
+                    elif event in ("question", "guidance"):
+                        # these ARE the user-facing answer, just structured
+                        # instead of prose — stream live like token, not
+                        # batched into activity
+                        yield _sse(event, payload)
+                    else:
+                        # internal_output (JSON leaking from a tool's nested
+                        # LLM call) and every other non-token event land
+                        # here — batched, never streamed live
+                        activity_log.append({"event": event, **payload})
             break  # completed without error
 
         except Exception as exc:
@@ -416,7 +511,13 @@ async def _stream_chat(
     # GET /session/{session_id}/subagent-status for the rest, since slow
     # tasks (hospital_notifier) can easily outlive this SSE connection.
     for event, payload in _drain_subagent_updates():
-        yield _sse(event, payload)
+        activity_log.append({"event": event, **payload})
+
+    # everything non-text goes out here, once, as a single frame — the
+    # client gets the full "what happened behind the scenes" picture
+    # in one shot instead of a live trickle of tool_call/step/etc. events.
+    if activity_log:
+        yield _sse("activity", {"session_id": session_id, "events": activity_log})
 
     yield _sse("done", {"session_id": session_id, "turn_type": turn_type})
 
@@ -431,7 +532,7 @@ async def chat(request: ChatRequest):
     Main chat endpoint — handles ALL messages (first emergency + follow-ups).
 
     First message (no session_id or new session):
-      → Agent analyses emergency, launches parallel RAG searches,
+      → Agent analyses emergency, launches parallel web searches,
         asks clarifying question, returns immediate guidance
 
     Subsequent messages (same session_id):
@@ -447,19 +548,42 @@ async def chat(request: ChatRequest):
     }
 
     SSE events:
-      turn_started      — { session_id, turn_type }
-      step              — agent node executing
-      tool_call         — tool being called (name only, streamed early)
-      tool_call_request — tool being called, with full args (supervisor's own tools only)
-      rag_event         — RAG search started/complete (silent progress)
-      subagent_complete — supervisor's own tool result (not RAG/hospital/youtube)
-      token             — agent response text → stream to chat
-      videos_incoming   — YouTube results being fetched
-      retrying          — a transient model error is being retried
-                           { attempt, max_attempts, message, delay_secs }
-      done              — { session_id, turn_type }
-      error             — terminal failure, safe to show the user
-                           { message, retryable }
+      turn_started — { session_id, turn_type }
+      token        — free-form response prose, streamed live. May still
+                     appear alongside `question`/`guidance` on a turn (e.g.
+                     a short intro sentence) — don't assume it's the ONLY
+                     source of user-facing content, just the unstructured
+                     part of it.
+      question     — { source, text } sent ONCE, live, straight from
+                     analyse_emergency's clarifying_question field. Render
+                     as a distinct "needs a reply" UI (see guidance below
+                     for why this exists instead of parsing prose).
+      guidance     — { source, priority_steps: [...], do_not: [...],
+                     watch_for: [...], reassurance, when_to_update_me }
+                     sent ONCE, live, straight from
+                     assemble_first_aid_response's structured tool result —
+                     not re-derived from the model's prose. Map each field
+                     to its own visual treatment (numbered steps, a
+                     "do not" callout, a "watch for" callout, etc.) instead
+                     of parsing markdown headers out of token text.
+      activity     — { session_id, events: [...] } sent ONCE, right before
+                     `done`. Bundles everything that isn't user-facing:
+                     step, tool_call, tool_call_request, web_event,
+                     subagent_complete, coordinator_event, internal_output
+                     — each list item has the same shape it used to have
+                     as its own SSE frame, just collected instead of
+                     streamed live.
+      retrying     — a transient model error is being retried (still live,
+                     since the client needs to know a retry is in progress)
+                     { attempt, max_attempts, message, delay_secs }
+      done         — { session_id, turn_type }
+      error        — terminal failure, safe to show the user (still live,
+                     ends the stream)
+                     { message, retryable }
+
+    Note: `activity`, `question`, and `guidance` may all be ABSENT on any
+    given turn — don't assume any of them always arrives. A turn with no
+    tool calls at all sends only token/turn_started/done.
     """
     is_new = False
 
@@ -472,7 +596,7 @@ async def chat(request: ChatRequest):
             "thread_id":        thread_id,
             "location":         request.location.model_dump(),
             "patient_profile":  request.patient_profile.model_dump(),
-            "rag_task_ids":     [],
+            "web_task_ids":     [],
             "youtube_task_ids": [],
             "subagent_status":  {},   # task_id -> {status, tool_calls, final}
         }
@@ -567,7 +691,7 @@ async def list_sessions():
             {
                 "session_id":    sid,
                 "thread_id":     s.get("thread_id"),
-                "rag_searches":  len(s.get("rag_task_ids", [])),
+                "web_searches":  len(s.get("web_task_ids", [])),
                 "youtube_tasks": len(s.get("youtube_task_ids", [])),
             }
             for sid, s in sessions.items()

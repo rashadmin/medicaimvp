@@ -1,5 +1,5 @@
 """
-MedicAI MVP — RAG Searcher (create_react_agent)
+MedicAI MVP — WEB Searcher (create_react_agent)
 """
 from __future__ import annotations
 
@@ -14,10 +14,11 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage
 from langgraph.prebuilt import create_react_agent
 
-from .rag_tool import search_first_aid_rag
+from .web_tool import search_first_aid_web
 
 SYSTEM_PROMPT = """
-You are a MedicAI RAG Search agent. You run as a background subagent.
+You are a MedicAI First Aid Search agent. You run as a background subagent.
+
 Your task arrives as a JSON string:
 {
   "query":       "<specific first-aid search query>",
@@ -25,20 +26,26 @@ Your task arrives as a JSON string:
   "search_id":   "<unique label>",
   "speculative": true | false
 }
+
 Workflow:
 1. Parse the task JSON
-2. Call search_first_aid_rag(query=<query>, tags=<tags>)
+2. Call search_first_aid_web(query=<query>, tags=<from langchain_google_genai import GoogleGenerativeAIEmbeddings
+tags>)
 3. Return the result clearly formatted:
+
 SEARCH_ID: <search_id>
 QUERY: <query>
 SPECULATIVE: <true|false>
 RESULT:
-<full context from RAG>
-SOURCES: <list of sources>
+<full context from web search>
+SOURCES: <list of source URLs>
+
 Rules:
-- Always call search_first_aid_rag — never skip it.
+- Always call search_first_aid_web — never skip it.
 - Return results immediately and completely.
+- If search returns no results, return: RESULT: No results found.
 - If search fails, return the error clearly.
+- Do not summarise or editorialise — return the full content.
 """.strip()
 
 llm = ChatGoogleGenerativeAI(
@@ -51,8 +58,8 @@ llm = ChatGoogleGenerativeAI(
 
 graph = create_react_agent(
     model=llm,
-    tools=[search_first_aid_rag],
+    tools=[search_first_aid_web],
     prompt=SystemMessage(SYSTEM_PROMPT),
 )
 
-print("[rag_searcher] ✅ graph compiled (create_react_agent, gemini-2.0-flash-lite)", flush=True)
+print("[web_searcher] ✅ graph compiled (create_react_agent, gemini-2.0-flash-lite)", flush=True)

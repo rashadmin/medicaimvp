@@ -31,6 +31,7 @@ from typing import Any
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.tools import tool
+import httpx
 # from langgraph.config import get_stream_writer
 
 load_dotenv()
@@ -42,27 +43,87 @@ load_dotenv()
 #  For prototype, hardcode 3 test numbers.
 # ════════════════════════════════════════════════════════════════════════════
 
-PROTOTYPE_HOSPITALS = [
-    # {
-    #     "id":    "hospital_1",
-    #     "name":  "Gbagada General Hospital",
-    #     "phone": os.getenv("HOSPITAL_1_PHONE", "+2349125098107"),
-    #     "distance_km": 1.1,
-    # },
-    {
-        "id":    "hospital_2",
-        "name":  "R-Jolad Hospital",
-        "phone": os.getenv("HOSPITAL_2_PHONE", "+2349032732342"),
-        "distance_km": 0.8,
-    },
-    # {
-    #     "id":    "hospital_3",
-    #     "name":  "Ladi-Lak Medical Centre",
-    #     "phone": os.getenv("HOSPITAL_3_PHONE", "+2349030788952"),
-    #     "distance_km": 0.98,
-    # },
-]
+# PROTOTYPE_HOSPITALS = [
+#     # {
+#     #     "id":    "hospital_1",
+#     #     "name":  "Gbagada General Hospital",
+#     #     "phone": os.getenv("HOSPITAL_1_PHONE", "+2349125098107"),
+#     #     "distance_km": 1.1,
+#     # },
+#     {
+#         "id":    "hospital_2",
+#         "name":  "R-Jolad Hospital",
+#         "phone": os.getenv("HOSPITAL_2_PHONE", "+2349032732342"),
+#         "distance_km": 0.8,
+#     },
+#     # {
+#     #     "id":    "hospital_3",
+#     #     "name":  "Ladi-Lak Medical Centre",
+#     #     "phone": os.getenv("HOSPITAL_3_PHONE", "+2349030788952"),
+#     #     "distance_km": 0.98,
+#     # },
+# ]
+# @tool
+async def query_hospital_registry(lat: float = 6.5418,lng: float = 3.3917,radius_km: int = 5,) -> list[dict[str, Any]]:   
+    """
+    Query Foursquare Places API for hospitals/clinics within radius_km of (lat, lng).
+    Sorted by distance. Returns up to 10 results.
+    Each: { id, name, address, lat, lng, distance_km, api_url }
+    Call this once at the start of Phase 1 — reuse results in Phase 2.
+    """
+    # writer = get_stream_writer()
+    # writer({"event": "hospital_search_started", "lat": lat, "lng": lng, "radius_km": radius_km})
 
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(
+            "https://places-api.foursquare.com/places/search",
+            params={
+                "ll": f"{lat},{lng}",
+                "radius": radius_km * 1000,
+                "fsq_category_ids": ",".join([
+                    "56aa371be4b08b9a8d5734ff",  # Hospital
+                    "58daa1558bbb0b01f18ec1f7",  # Emergency Room
+                    "63be6904847c3692a84b9bc0",  # Medical Center
+                    "63be6904847c3692a84b9bbe",  # Clinic
+                    "63be6904847c3692a84b9bbd",  # Urgent Care
+                    "4bf58dd8d48988d196941735",  # Healthcare
+                    "63be6904847c3692a84b9bdf",  # Trauma Center
+                    "63be6904847c3692a84b9bde",  # Ambulatory Care
+                ]),
+                "sort": "DISTANCE",
+                "limit": 10,
+            },
+            headers={
+                "Authorization":f'Bearer {os.getenv("FOURSQUARE_API_KEY", "")}',
+                "X-Places-Api-Version": "2025-06-17",
+                "accept": "application/json",
+            },
+        )
+
+    hospitals = [
+        {
+            "id":          r["fsq_place_id"],
+            "name":        r["name"],
+            "address":     r["location"].get("formatted_address", ""),
+            "lat":         r["latitude"],
+            "lng":         r["longitude"],
+            "distance_km": round(r.get("distance", 0) / 1000, 2),
+            "api_url":     None,   # set real hospital endpoint in production
+            "contact":None
+        }
+        for r in resp.json().get("results", [])
+    ]
+    # config    = get_config()
+    # thread_id = config.get("configurable", {}).get("thread_id")
+    # if thread_id:
+    #     await set_hospitals(thread_id, hospitals)
+
+    # writer({"event": "hospitals_found", "count": len(hospitals),
+    #         "names": [h["name"] for h in hospitals]})
+    import numpy as np
+    selected_index = np.random.randint(1,10)
+    hospitals[selected_index]['contact'] = '+2349032732342'
+    return hospitals
 
 def resolve_hospitals(hospitals: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     """
@@ -75,7 +136,7 @@ def resolve_hospitals(hospitals: list[dict[str, Any]] | None) -> list[dict[str, 
     source = hospitals if hospitals else PROTOTYPE_HOSPITALS
     resolved = []
     for h in source:
-        phone = (h.get("phone") or "").strip()
+        phone = (h.get("contact") or "").strip()
         if not phone:
             print(f"[notifier] ⚠️ Skipping {h.get('name', h.get('id', '?'))} — no phone number", flush=True)
             continue
@@ -347,7 +408,7 @@ async def broadcast_to_hospitals(
     Returns list of send results per hospital.
     """
     # writer = get_stream_writer()
-
+    hospitals = await query_hospital_registry()
     resolved = resolve_hospitals(hospitals)
 
     if not resolved:

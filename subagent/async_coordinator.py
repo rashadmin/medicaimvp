@@ -7,7 +7,7 @@ Debug checkpoints are tagged with [CHECKPOINT N] so you can trace exactly
 where execution stalls or fails.
 
 Run:
-    uvicorn rag_subagent.async_coordinator:app --reload --port 8000
+    uvicorn subagent.async_coordinator:app --reload --port 8000
 """
 
 from __future__ import annotations
@@ -35,15 +35,15 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # [CHECKPOINT 0] — graph import
-print("\n[CHECKPOINT 0] importing rag_graph...", flush=True)
+print("\n[CHECKPOINT 0] importing web_graph...", flush=True)
 try:
-    from subagent.rag_searcher import graph as rag_graph
+    from subagent.web_searcher import graph as web_graph
     from subagent.youtube_subagent import graph as youtube_graph
     from subagent.hospital_notifier import graph as hospital_graph
-    print("[CHECKPOINT 0] ✅ rag_graph imported successfully", flush=True)
-    print(f"[CHECKPOINT 0]    type(rag_graph) = {type(rag_graph)}", flush=True)
-    print(f"[CHECKPOINT 0]    has ainvoke    = {hasattr(rag_graph, 'ainvoke')}", flush=True)
-    print(f"[CHECKPOINT 0]    has invoke     = {hasattr(rag_graph, 'invoke')}", flush=True)
+    print("[CHECKPOINT 0] ✅ web_graph imported successfully", flush=True)
+    print(f"[CHECKPOINT 0]    type(web_graph) = {type(web_graph)}", flush=True)
+    print(f"[CHECKPOINT 0]    has ainvoke    = {hasattr(web_graph, 'ainvoke')}", flush=True)
+    print(f"[CHECKPOINT 0]    has invoke     = {hasattr(web_graph, 'invoke')}", flush=True)
     print("[CHECKPOINT 0] ✅ youtube_graph imported successfully", flush=True)
     print(f"[CHECKPOINT 0]    type(youtube_graph) = {type(youtube_graph)}", flush=True)
     print(f"[CHECKPOINT 0]    has ainvoke    = {hasattr(youtube_graph, 'ainvoke')}", flush=True)
@@ -54,7 +54,7 @@ except Exception as e:
     raise
 
 GRAPHS: dict[str, Any] = {
-    "rag_searcher": rag_graph,
+    "web_searcher": web_graph,
     "youtube_subagent":youtube_graph,
     "hospital_notifier": hospital_graph
 }
@@ -307,7 +307,7 @@ async def create_run(thread_id: str, request: Request) -> dict[str, Any]:
 
     body               = await request.json()
     multitask_strategy = body.get("multitask_strategy")
-    assistant_id       = body.get("assistant_id") or "rag_searcher"
+    assistant_id       = body.get("assistant_id") or "web_searcher"
 
     print(f"\n[CHECKPOINT A] create_run called", flush=True)
     print(f"[CHECKPOINT A]   thread_id    = {thread_id[:8]}", flush=True)
