@@ -1,5 +1,4 @@
 deepagents
-faiss
 fastapi
 httpx
 langchain
