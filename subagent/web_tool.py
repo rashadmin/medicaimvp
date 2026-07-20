@@ -25,7 +25,7 @@ from __future__ import annotations
 import os
 import asyncio
 from typing import Any
-import faiss, numpy as np, pickle
+import  numpy as np, pickle
 import pandas as pd
 import httpx
 from langchain_core.tools import tool
