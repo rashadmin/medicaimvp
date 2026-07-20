@@ -69,6 +69,20 @@ MAX_MODEL_RETRIES     = int(os.getenv("MAX_MODEL_RETRIES", "2"))
 MODEL_RETRY_BASE_DELAY = float(os.getenv("MODEL_RETRY_BASE_DELAY", "1.5"))
 
 
+# Tool calls that mark a real, user-noticeable wait between turns. When the
+# supervisor starts one of these, the client should already have shown the
+# question (or ack) and now needs a "still working" signal for the gap before
+# the next live event (token/question/guidance) arrives — otherwise a turn
+# that's quietly waiting on resolve_uncertainty + web results looks identical
+# to a dead connection. Mapped to a short, stable stage id the frontend can
+# key copy off of ("checking the latest guidance…", etc.) without parsing
+# tool names itself.
+STATUS_STAGE_TOOLS = {
+    "resolve_uncertainty":         "resolving_answer",
+    "assemble_first_aid_response": "assembling_guidance",
+}
+
+
 def _classify_error(exc: Exception) -> tuple[bool, str]:
     """Decide whether an exception from agent.astream() is worth retrying,
     and produce a message that's safe to send to the client.
@@ -151,6 +165,55 @@ def _safe_dict(data: any) -> dict:
         return dict(data)
     except Exception:
         return {}
+
+def _capture_task_ids(chunk: dict, session_id: str) -> None:
+    """
+    Scan updates chunks for async_tasks state channel updates.
+    This is where deepagents stores { task_id, agent_name, status }.
+    """
+    if chunk.get("type") != "updates":
+        return
+
+    data = chunk.get("data", {})
+    if not isinstance(data, dict):
+        try:    data = dict(data)
+        except: return
+
+    for node_name, node_data in data.items():
+        if node_data is None:
+            continue
+        if not isinstance(node_data, dict):
+            try:    node_data = dict(node_data)
+            except: continue
+
+        # async_tasks is a state channel updated by deepagents middleware
+        async_tasks = node_data.get("async_tasks", {})
+        if not async_tasks or not isinstance(async_tasks, dict):
+            continue
+
+        for task_id, task_info in async_tasks.items():
+            if not isinstance(task_info, dict):
+                continue
+            agent_name = task_info.get("agent_name", "")
+            print(f"[api] task captured: {agent_name} → {task_id[:8]}", flush=True)
+
+            if session_id not in sessions:
+                continue
+
+            if "hospital" in agent_name:
+                ids = sessions[session_id].setdefault("hospital_task_ids", [])
+                if task_id not in ids:
+                    ids.append(task_id)
+
+            elif "youtube" in agent_name:
+                ids = sessions[session_id].setdefault("youtube_task_ids", [])
+                if task_id not in ids:
+                    ids.append(task_id)
+
+            elif "rag" in agent_name:
+                ids = sessions[session_id].setdefault("rag_task_ids", [])
+                if task_id not in ids:
+                    ids.append(task_id)
 
 
 def _classify_chunk(chunk: dict, session_id: str, message_state: dict) -> tuple[str, dict] | None:
@@ -241,7 +304,9 @@ def _classify_chunk(chunk: dict, session_id: str, message_state: dict) -> tuple[
                     and hasattr(msg, "name")
                 ):
                     if msg.name == "start_async_task":
-                        _handle_task_launched(msg.content, session_id)
+                        pending = message_state.get("pending_subagent_types", [])
+                        subagent_type = pending.pop(0) if pending else ""
+                        _handle_task_launched(msg.content, session_id, subagent_type)
 
             # capture tool call ARGUMENTS. These only exist fully-formed on
             # the AIMessage in "updates" mode (node_data here, before the
@@ -255,6 +320,20 @@ def _classify_chunk(chunk: dict, session_id: str, message_state: dict) -> tuple[
                     if hasattr(msg, "type") and msg.type == "ai":
                         tool_calls = getattr(msg, "tool_calls", None) or []
                         if tool_calls:
+                            # Queue subagent_type per start_async_task call,
+                            # in call order — the ToolMessage carrying the
+                            # resulting task_id shows up in a LATER "updates"
+                            # chunk (once the "tools" node executes) with no
+                            # type info of its own, just "Launched async
+                            # subagent. task_id: ...". FIFO-pairing them here
+                            # is what lets _handle_task_launched below file
+                            # youtube tasks into youtube_task_ids instead of
+                            # everything defaulting to web_task_ids.
+                            for tc in tool_calls:
+                                if tc.get("name") == "start_async_task":
+                                    message_state.setdefault(
+                                        "pending_subagent_types", []
+                                    ).append(tc.get("args", {}).get("subagent_type", ""))
                             return "tool_call_request", {
                                 "source": source,
                                 "calls": [
@@ -298,6 +377,21 @@ def _classify_chunk(chunk: dict, session_id: str, message_state: dict) -> tuple[
                         # treatment: numbered steps, a red "do not" box, an
                         # amber "watch for" box, a muted reassurance line,
                         # and a follow-up prompt button.
+                        # assemble_immediate_steps is the small, certain-only
+                        # counterpart to guidance below — sent on the FIRST
+                        # message, before the clarifying question is
+                        # answered. Frontend should render it visually
+                        # distinct from `guidance` (fewer, smaller, no
+                        # do_not/watch_for/reassurance) since it's a partial,
+                        # not the full picture.
+                        if tool_name == "assemble_immediate_steps":
+                            parsed = _safe_json_loads(content)
+                            if parsed:
+                                return "quick_steps", {
+                                    "source":      source,
+                                    "quick_steps": parsed.get("quick_steps", []),
+                                }
+
                         if tool_name == "assemble_first_aid_response":
                             parsed = _safe_json_loads(content)
                             if parsed:
@@ -321,24 +415,44 @@ def _classify_chunk(chunk: dict, session_id: str, message_state: dict) -> tuple[
     return None
 
 
-def _handle_task_launched(content: str, session_id: str) -> None:
-    """Extract task_id from start_async_task result, store it, and kick off
-    a background watcher so its progress/result is recoverable later —
-    independent of whether this SSE turn is still open."""
+def _extract_videos_ready(final) -> list[dict] | None:
+    """If a completed subagent's final output is a youtube_subagent result
+    (marked with the VIDEOS_READY: prefix), parse and return the video list.
+    Returns None for any other kind of subagent output — the caller falls
+    back to the generic web_event/coordinator_event path in that case.
+    `final` may be a plain string or the list-of-content-block shape LangGraph
+    messages use ([{"type": "text", "text": "..."}])."""
+    text = final
+    if isinstance(text, list):
+        text = "".join(
+            block.get("text", "") for block in text if isinstance(block, dict)
+        )
+    if not isinstance(text, str) or "VIDEOS_READY:" not in text:
+        return None
     try:
+        return json.loads(text.split("VIDEOS_READY:", 1)[1].strip())
+    except Exception:
+        return None
+
+def _handle_task_launched(content: str, session_id: str, tool_name_hint: str = "") -> None:
+    """Extract task_id from start_async_task result and store by type."""
+    try:
+        import re
         match   = re.search(r"task_id[:\s]+([a-f0-9\-]{36})", str(content))
         task_id = match.group(1) if match else None
         if task_id and session_id in sessions:
-            sessions[session_id].setdefault("web_task_ids", []).append(task_id)
-            sessions[session_id].setdefault("subagent_status", {})[task_id] = {
-                "status": "pending", "tool_calls": [], "final": "",
-            }
-            asyncio.create_task(
-                _watch_subagent_task(session_id, task_id),
-                name=f"watch-{task_id[:8]}",
-            )
+            # store all task_ids — categorize by agent name in content
+            content_lower = str(content).lower()
+            if "youtube" in content_lower:
+                sessions[session_id].setdefault("youtube_task_ids", []).append(task_id)
+            elif "hospital" in content_lower:
+                sessions[session_id].setdefault("hospital_task_ids", []).append(task_id)
+            else:
+                sessions[session_id].setdefault("web_task_ids", []).append(task_id)
     except Exception:
         pass
+
+
 
 
 async def _read_subagent_thread(task_id: str) -> dict | None:
@@ -420,12 +534,29 @@ async def _stream_chat(
         that finished since we last looked. This is what makes fast subagent
         completions (e.g. a quick web search) show up as web_event /
         coordinator_event WHILE this turn's SSE connection is still open —
-        without this turn having to wait on them itself."""
+        without this turn having to wait on them itself.
+
+        A completed youtube_subagent task is a special case: rather than
+        falling into the generic web_event bucket (batched, silent until
+        `activity` fires), it's detected via its VIDEOS_READY: marker and
+        returned as its own "videos" event — the caller streams this live,
+        same treatment as `guidance`, so the frontend has a clear signal for
+        where to place the video instead of discovering it only by polling
+        /session/videos after the fact."""
         out = []
         for tid, st in sessions.get(session_id, {}).get("subagent_status", {}).items():
             if tid in already_emitted or st["status"] not in ("complete", "timeout"):
                 continue
             already_emitted.add(tid)
+
+            if st["status"] == "complete":
+                videos = _extract_videos_ready(st.get("final", ""))
+                if videos is not None:
+                    out.append(("videos", {
+                        "source": "youtube_subagent", "task_id": tid, "videos": videos,
+                    }))
+                    continue
+
             event = "web_event" if st["status"] == "complete" else "coordinator_event"
             out.append((event, {
                 "source": "subagent", "task_id": tid, "status": st["status"],
@@ -465,22 +596,49 @@ async def _stream_chat(
                 subgraphs=True,
                 version="v2",
             ):
-                # subagent progress picked up since the last chunk — queue
-                # it instead of yielding live
+                # subagent progress picked up since the last chunk. `videos`
+                # is user-facing (same treatment as guidance) so it streams
+                # live; everything else queues into activity as before.
                 for event, payload in _drain_subagent_updates():
-                    activity_log.append({"event": event, **payload})
-
+                    if event == "videos":
+                        yield _sse(event, payload)
+                    else:
+                        activity_log.append({"event": event, **payload})
+                _capture_task_ids(chunk, session_id)
                 classified = _classify_chunk(chunk, session_id, message_state)
                 if classified:
                     event, payload = classified
+                    if event == "subagent_complete" and payload.get("tool") == "send_alerts":
+                    	try:
+                    		content = json.loads(payload.get("content", "{}"))
+                    		if isinstance(content, list):
+                    			sessions[session_id]["alerts"] = content
+                    	except Exception:
+                    		pass
+                    yield _sse(event, payload)
                     if event == "token":
                         tokens_sent = True
                         yield _sse(event, payload)
-                    elif event in ("question", "guidance"):
+                    elif event in ("question", "guidance", "quick_steps"):
                         # these ARE the user-facing answer, just structured
                         # instead of prose — stream live like token, not
                         # batched into activity
                         yield _sse(event, payload)
+                    elif event == "tool_call_request":
+                        # normally batched into activity_log below — but if
+                        # this call is one of the "the user is waiting on
+                        # this" tools, also fire a live status event first so
+                        # the client can show a working indicator during the
+                        # gap. The tool_call_request itself still goes into
+                        # activity as usual; this is additive, not a replacement.
+                        for call in payload.get("calls", []):
+                            stage = STATUS_STAGE_TOOLS.get(call.get("tool"))
+                            if stage:
+                                yield _sse("status", {
+                                    "source": payload.get("source", "supervisor"),
+                                    "stage":  stage,
+                                })
+                        activity_log.append({"event": event, **payload})
                     else:
                         # internal_output (JSON leaking from a tool's nested
                         # LLM call) and every other non-token event land
@@ -511,7 +669,10 @@ async def _stream_chat(
     # GET /session/{session_id}/subagent-status for the rest, since slow
     # tasks (hospital_notifier) can easily outlive this SSE connection.
     for event, payload in _drain_subagent_updates():
-        activity_log.append({"event": event, **payload})
+        if event == "videos":
+            yield _sse(event, payload)
+        else:
+            activity_log.append({"event": event, **payload})
 
     # everything non-text goes out here, once, as a single frame — the
     # client gets the full "what happened behind the scenes" picture
@@ -558,6 +719,31 @@ async def chat(request: ChatRequest):
                      analyse_emergency's clarifying_question field. Render
                      as a distinct "needs a reply" UI (see guidance below
                      for why this exists instead of parsing prose).
+      quick_steps  — { source, quick_steps: [...] } sent ONCE, live, on the
+                     FIRST message only — straight from
+                     assemble_immediate_steps's structured tool result.
+                     Max 3 items, built only from certain_conditions, no
+                     do_not/watch_for/reassurance. Absent whenever
+                     certain_conditions was empty (nothing certain yet to
+                     act on). This is a partial, smaller sibling of
+                     `guidance` below — render it visually distinct (e.g.
+                     a compact "do this now" list) so it isn't mistaken for
+                     the full guidance that arrives after the clarifying
+                     question is answered.
+      videos       — { source, task_id, videos: [...] } sent live, as many
+                     times as youtube_subagent tasks complete during this
+                     turn's connection (0, 1, or more — a technique change
+                     mid-conversation can trigger a second one). Each
+                     `videos` item is { title, url, thumbnail, channel,
+                     description }. youtube_subagent is otherwise
+                     fire-and-forget/non-blocking, so most completions land
+                     well after the triggering turn has ended — this event
+                     only fires for ones that finish INSIDE the current SSE
+                     connection. For anything that finishes after the
+                     stream closes, keep polling
+                     GET /session/videos/{session_id} as before; this event
+                     is an optimization for the common case, not a
+                     replacement for that fallback.
       guidance     — { source, priority_steps: [...], do_not: [...],
                      watch_for: [...], reassurance, when_to_update_me }
                      sent ONCE, live, straight from
@@ -573,6 +759,17 @@ async def chat(request: ChatRequest):
                      — each list item has the same shape it used to have
                      as its own SSE frame, just collected instead of
                      streamed live.
+      status       — { source, stage } sent live whenever the supervisor
+                     starts a tool call the user is meaningfully waiting on
+                     (resolve_uncertainty, assemble_first_aid_response).
+                     `stage` is one of: "resolving_answer",
+                     "assembling_guidance". Fires between a user's reply and
+                     the next live event on that turn — use it to show a
+                     "checking the latest guidance…" indicator, and clear it
+                     as soon as any token/question/guidance event arrives.
+                     May fire more than once per turn (e.g. resolving_answer
+                     then assembling_guidance back to back) — always show
+                     the most recent stage received, don't queue them.
       retrying     — a transient model error is being retried (still live,
                      since the client needs to know a retry is in progress)
                      { attempt, max_attempts, message, delay_secs }
@@ -581,9 +778,10 @@ async def chat(request: ChatRequest):
                      ends the stream)
                      { message, retryable }
 
-    Note: `activity`, `question`, and `guidance` may all be ABSENT on any
-    given turn — don't assume any of them always arrives. A turn with no
-    tool calls at all sends only token/turn_started/done.
+    Note: `activity`, `question`, `quick_steps`, `videos`, `guidance`, and
+    `status` may all be ABSENT on any given turn — don't assume any of them
+    always arrives. A turn with no tool calls at all sends only
+    token/turn_started/done.
     """
     is_new = False
 
@@ -598,6 +796,7 @@ async def chat(request: ChatRequest):
             "patient_profile":  request.patient_profile.model_dump(),
             "web_task_ids":     [],
             "youtube_task_ids": [],
+            "hospital_task_ids":[],
             "subagent_status":  {},   # task_id -> {status, tool_calls, final}
         }
     else:
@@ -624,7 +823,7 @@ async def get_videos(session_id: str):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
 
-    youtube_url = os.getenv("YOUTUBE_SEARCHER_URL", "http://localhost:8001")
+    youtube_url = os.getenv("YOUTUBE_SEARCHER_URL", "http://localhost:8000")
     task_ids    = session.get("youtube_task_ids", [])
 
     if not task_ids:
@@ -632,6 +831,8 @@ async def get_videos(session_id: str):
 
     import httpx
     latest = task_ids[-1]
+    print(task_ids)
+    print('youtube tasj id',latest)
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp    = await client.get(f"{youtube_url}/threads/{latest}")
@@ -640,12 +841,11 @@ async def get_videos(session_id: str):
             videos  = []
             for msg in reversed(msgs):
                 content = msg.get("content", "") if isinstance(msg, dict) else ""
-                if "VIDEOS_READY:" in content:
-                    try:
-                        videos = json.loads(content.split("VIDEOS_READY:", 1)[1].strip())
-                        break
-                    except Exception:
-                        pass
+                try:
+                	videos = json.loads(msg.get('content',[]))
+                	break
+                except Exception:
+                	pass
             status = "ready" if videos else "pending"
         return JSONResponse({"status": status, "videos": videos})
     except Exception as e:
@@ -681,6 +881,67 @@ async def subagent_status(session_id: str):
         "session_id": session_id,
         "tasks": session.get("subagent_status", {}),
     })
+
+
+@app.get("/session/hospitals/{session_id}")
+async def get_hospitals(session_id: str):
+    """
+    Get hospital details discovered by the hospital coordinator for this session.
+    Poll this after /chat to see which hospitals were found and their alert status.
+
+    Response:
+    {
+      "session_id":   "...",
+      "status":       "pending" | "ready",
+      "hospitals":    [ { id, name, address, lat, lng, distance_km, api_url } ],
+      "alerts":       [ { hospital, status, hospital_response } ],
+      "accepted":     [ "Hospital Name", ... ]
+    }
+    """
+    session = sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    youtube_url = os.getenv("YOUTUBE_SEARCHER_URL", "http://localhost:8000")
+    task_ids    = session.get("hospital_task_ids", [])
+
+    if not task_ids:
+        return JSONResponse({"status": "no_task", "hospital_task": []})
+
+    import httpx
+    latest = task_ids[-1]
+    print('hos',task_ids)
+    print('hospital',latest)
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp    = await client.get(f"{youtube_url}/threads/{latest}")
+            data    = resp.json()
+            msgs    = data.get("values", {}).get("messages", [])
+            hospitals  = []
+            for msg in reversed(msgs):
+                if msg['name'] == 'broadcast_to_hospitals':
+                    content = msg.get("content", "") if isinstance(msg, dict) else ""
+                    try:
+                        hospitals = json.loads(msg.get('content',[]))
+                        break
+                    except Exception:
+                        pass
+            status = "ready" if hospitals else "pending"
+
+        return JSONResponse({"status": status, "hospitals": hospitals})
+    except Exception as e:
+        return JSONResponse({"status": "error", "hospitals": [], "message": str(e)})
+    
+    # return JSONResponse({
+    #     "session_id": session_id,
+    #     "status":     "ready" if session.get("hospitals") else "pending",
+    #     "hospitals":  session.get("hospitals", []),
+    #     "alerts":     session.get("alerts", []),
+    #     "accepted":   [
+    #         a["hospital"]["name"]
+    #         for a in session.get("alerts", [])
+    #         if a.get("hospital_response", {}).get("accepted")
+    #     ],
+    # })
 
 
 @app.get("/sessions")

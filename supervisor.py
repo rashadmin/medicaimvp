@@ -371,7 +371,7 @@ web_searcher = AsyncSubAgent(
         "Cancel speculative searches with cancel_async_task if no longer needed."
     ),
     graph_id="web_searcher",
-    url="http://localhost:8000"
+    url=os.getenv("SUBAGENT_URL", "http://localhost:8000")#"http://localhost:8000"
 )
 
 youtube_subagent = AsyncSubAgent(
@@ -383,7 +383,7 @@ youtube_subagent = AsyncSubAgent(
         "Non-blocking — frontend polls /session/videos for results."
     ),
     graph_id="youtube_subagent",
-    url="http://localhost:8000"
+    url=os.getenv("SUBAGENT_URL", "http://localhost:8000")#"http://localhost:8000"
 )
 
 hospital_notifier = AsyncSubAgent(
@@ -396,7 +396,7 @@ hospital_notifier = AsyncSubAgent(
         "Non-blocking — returns task_id immediately."
     ),
     graph_id="hospital_notifier",
-    url="http://localhost:8000",
+    url=os.getenv("SUBAGENT_URL", "http://localhost:8000")#"http://localhost:8000",
 )
 
 # ════════════════════════════════════════════════════════════════════════════

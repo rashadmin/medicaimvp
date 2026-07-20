@@ -99,7 +99,7 @@ async def query_hospital_registry(lat: float = 6.5418,lng: float = 3.3917,radius
                 "accept": "application/json",
             },
         )
-
+			
     hospitals = [
         {
             "id":          r["fsq_place_id"],
@@ -216,6 +216,9 @@ async def _send_sms_fallback(
         return {
             "hospital_id":   hospital["id"],
             "hospital_name": hospital["name"],
+            "hospital_address":hospital['address'],
+            "contact":hospital['contact'],
+            "distance":hospital['distance_km'],
             "status":        "sent",
             "channel":       "sms",
             "message_sid":   msg.sid,
@@ -375,6 +378,9 @@ async def send_whatsapp_alert(
         return {
             "hospital_id":   hospital["id"],
             "hospital_name": hospital["name"],
+            "hospital_address":hospital['address'],
+            "contact":hospital['contact'],
+            "distance":hospital['distance_km'],
             "status":        "sent",
             "channel":       "whatsapp_template" if TWILIO_ALERT_TEMPLATE_SID else "whatsapp",
             "message_sid":   msg.sid,
@@ -417,18 +423,18 @@ async def broadcast_to_hospitals(
 
     # writer({"event": "broadcast_started", "hospital_count": len(resolved)})
     print(f"[notifier] Broadcasting to {len(resolved)} hospitals...", flush=True)
+    results = resolved
+    #results = list(await asyncio.gather(*[
+        #send_whatsapp_alert.ainvoke({
+         #   "hospital":     h,
+        #    "alert_report": alert_report,
+       #     "session_id":   session_id,
+      #  })
+     #   for h in resolved
+    #]))
 
-    results = list(await asyncio.gather(*[
-        send_whatsapp_alert.ainvoke({
-            "hospital":     h,
-            "alert_report": alert_report,
-            "session_id":   session_id,
-        })
-        for h in resolved
-    ]))
-
-    sent     = [r for r in results if r.get("status") == "sent"]
-    failed   = [r for r in results if r.get("status") == "failed"]
+    #sent     = [r for r in results if r.get("status") == "sent"]
+    #failed   = [r for r in results if r.get("status") == "failed"]
 
     # writer({
     #     "event":   "broadcast_complete",
@@ -437,5 +443,5 @@ async def broadcast_to_hospitals(
     #     "results": results,
     # })
 
-    print(f"[notifier] ✅ Sent: {len(sent)} | Failed: {len(failed)}", flush=True)
+#    print(f"[notifier] ✅ Sent: {len(sent)} | Failed: {len(failed)}", flush=True)
     return results

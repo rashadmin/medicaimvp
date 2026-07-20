@@ -166,6 +166,55 @@ def _safe_dict(data: any) -> dict:
     except Exception:
         return {}
 
+def _capture_task_ids(chunk: dict, session_id: str) -> None:
+    """
+    Scan updates chunks for async_tasks state channel updates.
+    This is where deepagents stores { task_id, agent_name, status }.
+    """
+    if chunk.get("type") != "updates":
+        return
+
+    data = chunk.get("data", {})
+    if not isinstance(data, dict):
+        try:    data = dict(data)
+        except: return
+
+    for node_name, node_data in data.items():
+        if node_data is None:
+            continue
+        if not isinstance(node_data, dict):
+            try:    node_data = dict(node_data)
+            except: continue
+
+        # async_tasks is a state channel updated by deepagents middleware
+        async_tasks = node_data.get("async_tasks", {})
+        if not async_tasks or not isinstance(async_tasks, dict):
+            continue
+
+        for task_id, task_info in async_tasks.items():
+            if not isinstance(task_info, dict):
+                continue
+            agent_name = task_info.get("agent_name", "")
+            print(f"[api] task captured: {agent_name} → {task_id[:8]}", flush=True)
+
+            if session_id not in sessions:
+                continue
+
+            if "hospital" in agent_name:
+                ids = sessions[session_id].setdefault("hospital_task_ids", [])
+                if task_id not in ids:
+                    ids.append(task_id)
+
+            elif "youtube" in agent_name:
+                ids = sessions[session_id].setdefault("youtube_task_ids", [])
+                if task_id not in ids:
+                    ids.append(task_id)
+
+            elif "rag" in agent_name:
+                ids = sessions[session_id].setdefault("rag_task_ids", [])
+                if task_id not in ids:
+                    ids.append(task_id)
+
 
 def _classify_chunk(chunk: dict, session_id: str, message_state: dict) -> tuple[str, dict] | None:
     chunk_type = chunk.get("type")
@@ -385,33 +434,25 @@ def _extract_videos_ready(final) -> list[dict] | None:
     except Exception:
         return None
 
-
-def _handle_task_launched(content: str, session_id: str, subagent_type: str = "") -> None:
-    """Extract task_id from start_async_task result, store it, and kick off
-    a background watcher so its progress/result is recoverable later —
-    independent of whether this SSE turn is still open.
-
-    subagent_type routes the id into the right bucket: youtube_subagent
-    tasks go into youtube_task_ids (what GET /session/videos polls), every
-    other type (web_searcher, hospital_notifier) into web_task_ids. Caller
-    passes "" when the type couldn't be determined (e.g. queue was empty) —
-    falls back to web_task_ids, the old default, rather than dropping the
-    id entirely."""
+def _handle_task_launched(content: str, session_id: str, tool_name_hint: str = "") -> None:
+    """Extract task_id from start_async_task result and store by type."""
     try:
+        import re
         match   = re.search(r"task_id[:\s]+([a-f0-9\-]{36})", str(content))
         task_id = match.group(1) if match else None
         if task_id and session_id in sessions:
-            bucket = "youtube_task_ids" if subagent_type == "youtube_subagent" else "web_task_ids"
-            sessions[session_id].setdefault(bucket, []).append(task_id)
-            sessions[session_id].setdefault("subagent_status", {})[task_id] = {
-                "status": "pending", "tool_calls": [], "final": "",
-            }
-            asyncio.create_task(
-                _watch_subagent_task(session_id, task_id),
-                name=f"watch-{task_id[:8]}",
-            )
+            # store all task_ids — categorize by agent name in content
+            content_lower = str(content).lower()
+            if "youtube" in content_lower:
+                sessions[session_id].setdefault("youtube_task_ids", []).append(task_id)
+            elif "hospital" in content_lower:
+                sessions[session_id].setdefault("hospital_task_ids", []).append(task_id)
+            else:
+                sessions[session_id].setdefault("web_task_ids", []).append(task_id)
     except Exception:
         pass
+
+
 
 
 async def _read_subagent_thread(task_id: str) -> dict | None:
@@ -563,10 +604,18 @@ async def _stream_chat(
                         yield _sse(event, payload)
                     else:
                         activity_log.append({"event": event, **payload})
-
+                _capture_task_ids(chunk, session_id)
                 classified = _classify_chunk(chunk, session_id, message_state)
                 if classified:
                     event, payload = classified
+                    if event == "subagent_complete" and payload.get("tool") == "send_alerts":
+                    	try:
+                    		content = json.loads(payload.get("content", "{}"))
+                    		if isinstance(content, list):
+                    			sessions[session_id]["alerts"] = content
+                    	except Exception:
+                    		pass
+                    yield _sse(event, payload)
                     if event == "token":
                         tokens_sent = True
                         yield _sse(event, payload)
@@ -747,6 +796,7 @@ async def chat(request: ChatRequest):
             "patient_profile":  request.patient_profile.model_dump(),
             "web_task_ids":     [],
             "youtube_task_ids": [],
+            "hospital_task_ids":[],
             "subagent_status":  {},   # task_id -> {status, tool_calls, final}
         }
     else:
@@ -773,7 +823,7 @@ async def get_videos(session_id: str):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
 
-    youtube_url = os.getenv("YOUTUBE_SEARCHER_URL", "http://localhost:8001")
+    youtube_url = os.getenv("YOUTUBE_SEARCHER_URL", "http://localhost:8000")
     task_ids    = session.get("youtube_task_ids", [])
 
     if not task_ids:
@@ -781,6 +831,8 @@ async def get_videos(session_id: str):
 
     import httpx
     latest = task_ids[-1]
+    print(task_ids)
+    print('youtube tasj id',latest)
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp    = await client.get(f"{youtube_url}/threads/{latest}")
@@ -789,12 +841,11 @@ async def get_videos(session_id: str):
             videos  = []
             for msg in reversed(msgs):
                 content = msg.get("content", "") if isinstance(msg, dict) else ""
-                if "VIDEOS_READY:" in content:
-                    try:
-                        videos = json.loads(content.split("VIDEOS_READY:", 1)[1].strip())
-                        break
-                    except Exception:
-                        pass
+                try:
+                	videos = json.loads(msg.get('content',[]))
+                	break
+                except Exception:
+                	pass
             status = "ready" if videos else "pending"
         return JSONResponse({"status": status, "videos": videos})
     except Exception as e:
@@ -830,6 +881,67 @@ async def subagent_status(session_id: str):
         "session_id": session_id,
         "tasks": session.get("subagent_status", {}),
     })
+
+
+@app.get("/session/hospitals/{session_id}")
+async def get_hospitals(session_id: str):
+    """
+    Get hospital details discovered by the hospital coordinator for this session.
+    Poll this after /chat to see which hospitals were found and their alert status.
+
+    Response:
+    {
+      "session_id":   "...",
+      "status":       "pending" | "ready",
+      "hospitals":    [ { id, name, address, lat, lng, distance_km, api_url } ],
+      "alerts":       [ { hospital, status, hospital_response } ],
+      "accepted":     [ "Hospital Name", ... ]
+    }
+    """
+    session = sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    youtube_url = os.getenv("YOUTUBE_SEARCHER_URL", "http://localhost:8000")
+    task_ids    = session.get("hospital_task_ids", [])
+
+    if not task_ids:
+        return JSONResponse({"status": "no_task", "hospital_task": []})
+
+    import httpx
+    latest = task_ids[-1]
+    print('hos',task_ids)
+    print('hospital',latest)
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp    = await client.get(f"{youtube_url}/threads/{latest}")
+            data    = resp.json()
+            msgs    = data.get("values", {}).get("messages", [])
+            hospitals  = []
+            for msg in reversed(msgs):
+                if msg['name'] == 'broadcast_to_hospitals':
+                    content = msg.get("content", "") if isinstance(msg, dict) else ""
+                    try:
+                        hospitals = json.loads(msg.get('content',[]))
+                        break
+                    except Exception:
+                        pass
+            status = "ready" if hospitals else "pending"
+
+        return JSONResponse({"status": status, "hospitals": hospitals})
+    except Exception as e:
+        return JSONResponse({"status": "error", "hospitals": [], "message": str(e)})
+    
+    # return JSONResponse({
+    #     "session_id": session_id,
+    #     "status":     "ready" if session.get("hospitals") else "pending",
+    #     "hospitals":  session.get("hospitals", []),
+    #     "alerts":     session.get("alerts", []),
+    #     "accepted":   [
+    #         a["hospital"]["name"]
+    #         for a in session.get("alerts", [])
+    #         if a.get("hospital_response", {}).get("accepted")
+    #     ],
+    # })
 
 
 @app.get("/sessions")
