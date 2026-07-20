@@ -11,4 +11,5 @@ pandas
 pydantic
 python-dotenv
 tavily_python
+uvicorn
 twilio
