@@ -354,19 +354,32 @@ def _classify_chunk(chunk: dict, session_id: str, message_state: dict) -> tuple[
                                 "tool":   tool_name,
                             }
 
-                        # analyse_emergency's clarifying_question is already
-                        # a clean, isolated string — surface it as its own
-                        # event so the frontend can render a distinct
-                        # "needs a reply" UI instead of parsing prose for a
-                        # question mark. Only fires when the field is
-                        # actually populated (e.g. not on resolve_uncertainty
-                        # follow-up turns, which don't have this field) —
-                        # falls through to the generic path otherwise.
-                        if tool_name == "analyse_emergency":
-                            parsed   = _safe_json_loads(content)
-                            question = parsed.get("clarifying_question") if parsed else None
-                            if question:
-                                return "question", {"source": source, "text": question}
+                        # analyse_emergency's clarifying_question field is
+                        # internal reasoning input ONLY (per SYSTEM_PROMPT's
+                        # hard rules) — it's a plain string with no preset
+                        # options, and the model decides what to actually ask
+                        # via a SEPARATE, later call to ask_clarifying_question
+                        # (see below). Do NOT surface it here — that would
+                        # leak a button-less, premature question event ahead
+                        # of the real one.
+
+                        # ask_clarifying_question is the tool that actually
+                        # produces the user-facing question — called AFTER
+                        # the text response, per step 7/8 of SYSTEM_PROMPT.
+                        # Its result is already { question, options, context,
+                        # type }, so surface it straight through as its own
+                        # live event — this is what the frontend renders as
+                        # a card with tappable buttons, distinct from the
+                        # free-form `token` text that precedes it.
+                        if tool_name == "ask_clarifying_question":
+                            parsed = _safe_json_loads(content)
+                            if parsed:
+                                return "clarifying_question", {
+                                    "source":   source,
+                                    "question": parsed.get("question", ""),
+                                    "options":  parsed.get("options", []),
+                                    "context":  parsed.get("context", ""),
+                                }
 
                         # assemble_first_aid_response already returns fully
                         # structured guidance — send it straight through as
@@ -619,7 +632,7 @@ async def _stream_chat(
                     if event == "token":
                         tokens_sent = True
                         yield _sse(event, payload)
-                    elif event in ("question", "guidance", "quick_steps"):
+                    elif event in ("clarifying_question", "guidance", "quick_steps"):
                         # these ARE the user-facing answer, just structured
                         # instead of prose — stream live like token, not
                         # batched into activity
@@ -715,10 +728,18 @@ async def chat(request: ChatRequest):
                      a short intro sentence) — don't assume it's the ONLY
                      source of user-facing content, just the unstructured
                      part of it.
-      question     — { source, text } sent ONCE, live, straight from
-                     analyse_emergency's clarifying_question field. Render
-                     as a distinct "needs a reply" UI (see guidance below
-                     for why this exists instead of parsing prose).
+      clarifying_question — { source, question, options: [...], context }
+                     sent ONCE, live, straight from ask_clarifying_question's
+                     structured tool result. This is a SEPARATE event from
+                     the preceding `token` text — the model's text response
+                     never contains the question itself (see SYSTEM_PROMPT
+                     step 7/8), so the frontend gets prose first, then this
+                     event with preset answer options. Render as a card with
+                     tappable buttons, one per option; when the user taps
+                     one, send that option's exact string back as the next
+                     /chat message's `message` field. `context` is a short
+                     line on why the question matters medically (e.g. "This
+                     determines if CPR is needed") — optional to display.
       quick_steps  — { source, quick_steps: [...] } sent ONCE, live, on the
                      FIRST message only — straight from
                      assemble_immediate_steps's structured tool result.
@@ -778,10 +799,10 @@ async def chat(request: ChatRequest):
                      ends the stream)
                      { message, retryable }
 
-    Note: `activity`, `question`, `quick_steps`, `videos`, `guidance`, and
-    `status` may all be ABSENT on any given turn — don't assume any of them
-    always arrives. A turn with no tool calls at all sends only
-    token/turn_started/done.
+    Note: `activity`, `clarifying_question`, `quick_steps`, `videos`,
+    `guidance`, and `status` may all be ABSENT on any given turn — don't
+    assume any of them always arrives. A turn with no tool calls at all
+    sends only token/turn_started/done.
     """
     is_new = False
 

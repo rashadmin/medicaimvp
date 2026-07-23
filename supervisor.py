@@ -222,6 +222,55 @@ Respond ONLY as JSON:
             "summary":              user_response,
         }
 
+class ClarifyingQuestion(BaseModel):
+    question: str        = Field(description="The question to ask the user")
+    options:  list[str]  = Field(description="Preset answer options e.g. ['Yes', 'No']")
+    context:  str        = Field(description="Brief context for why this matters medically")
+
+
+@tool
+def ask_clarifying_question(
+    question: str,
+    options:  list[str],
+    context:  str = "",
+) -> dict:
+    """
+    Ask the user a clarifying question with preset options (buttons).
+    Call this AFTER sending your initial text response to the user.
+    The question will be rendered as a separate UI element with clickable buttons.
+    Do NOT include the question in your text response — call this tool instead.
+
+    Args:
+        question : the question to ask, e.g. "Is your son breathing?"
+        options  : preset choices e.g. ["Yes", "No"] or
+                   ["Conscious", "Unconscious"] or
+                   ["Chest pain", "Shortness of breath", "Both"]
+        context  : why this matters e.g. "This determines if CPR is needed"
+
+    Examples:
+        ask_clarifying_question(
+            question="Is the person breathing?",
+            options=["Yes, breathing", "No, not breathing", "Gasping/irregular"],
+            context="Breathing status determines if CPR is needed immediately"
+        )
+        ask_clarifying_question(
+            question="Is the person conscious?",
+            options=["Yes, conscious", "No, unconscious"],
+            context="Consciousness level affects recovery position"
+        )
+        ask_clarifying_question(
+            question="Where is the wound?",
+            options=["Chest", "Abdomen", "Limb", "Head/neck"],
+            context="Location determines bleeding control approach"
+        )
+    """
+    return {
+        "question": question,
+        "options":  options,
+        "context":  context,
+        "type":     "clarifying_question",
+    }
+
 
 @tool
 def assemble_first_aid_response(
@@ -489,17 +538,27 @@ ON FIRST EMERGENCY MESSAGE
     the handful of actions that are already certain and can't get more
     correct by waiting.
 
-7. Respond to user with:
-   a. Brief acknowledgement of the emergency
-   b. "Nearby hospitals are being alerted."
-   c. If assemble_immediate_steps was called: a brief line pointing at it,
-      e.g. "Here's what to do right now —" — do NOT re-list the steps
-      yourself, they render from the tool result directly.
-   d. The ONE clarifying question from analyse_emergency
-   Keep this SHORT — the user is in crisis.
-   Write this as your OWN plain-language sentences — never the
-   analyse_emergency or assemble_immediate_steps dict itself, in whole or
-   in part.
+
+7. Write your text response to the user — plain text only, NO question:
+   "Your [relationship] has been [emergency summary] — this is critical.
+   Hospitals near you are being contacted right now.
+   Call 112 immediately."
+   
+   STOP. Do not include any question in this text.
+
+8. THEN call ask_clarifying_question() separately:
+   e.g ask_clarifying_question(
+     question="Is [patient] breathing?",
+     options=["Yes, breathing normally",
+              "No, not breathing",
+              "Breathing but very slowly"],
+     context="This determines if CPR is needed right now"
+   )
+
+The question renders as buttons in the UI — separate from your text.
+Never write the question in your text message.
+Never call ask_clarifying_question before writing your text response.
+
 
 ════════════════════════════════════════════
 ON USER ANSWER TO CLARIFYING QUESTION
@@ -670,6 +729,18 @@ HARD RULES
 """.strip()
 
 
+#7. Respond to user with:
+ #  a. Brief acknowledgement of the emergency
+  # b. "Nearby hospitals are being alerted."
+   #c. If assemble_immediate_steps was called: a brief line pointing at it,
+    #  e.g. "Here's what to do right now —" — do NOT re-list the steps
+     # yourself, they render from the tool result directly.
+   #Keep this SHORT — the user is in crisis.
+   #Write this as your OWN plain-language sentences — never the
+   
+   #analyse_emergency or assemble_immediate_steps dict itself, in whole or
+   #in part.
+
 # ════════════════════════════════════════════════════════════════════════════
 #  DEEP AGENT
 # ════════════════════════════════════════════════════════════════════════════
@@ -684,7 +755,7 @@ llm = ChatGoogleGenerativeAI(
 
 agent = create_deep_agent(
     model=llm,
-    tools=[analyse_emergency, resolve_uncertainty, assemble_first_aid_response, assemble_immediate_steps],
+    tools=[analyse_emergency, resolve_uncertainty, assemble_first_aid_response, assemble_immediate_steps, ask_clarifying_question],
     system_prompt=SYSTEM_PROMPT,
     subagents=[web_searcher, youtube_subagent, hospital_notifier],  # ← added
     checkpointer=checkpointer,
