@@ -64,7 +64,7 @@ load_dotenv()
 #     # },
 # ]
 # @tool
-async def query_hospital_registry(lat: float = 6.5418,lng: float = 3.3917,radius_km: int = 5,) -> list[dict[str, Any]]:   
+async def query_hospital_registry(lat: float ,lng: float ,radius_km: int = 5,) -> list[dict[str, Any]]:   
     """
     Query Foursquare Places API for hospitals/clinics within radius_km of (lat, lng).
     Sorted by distance. Returns up to 10 results.
