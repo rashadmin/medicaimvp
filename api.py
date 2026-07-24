@@ -342,6 +342,13 @@ def _classify_chunk(chunk: dict, session_id: str, message_state: dict) -> tuple[
                 prefix = state["buffer"][:DEDUPE_PREFIX_LEN]
                 is_repeat = any(
                     other_id != msg_id
+                    and isinstance(other_state, dict)  # message_state also
+                    # holds non-per-message entries (e.g. the list under
+                    # "pending_subagent_types" set elsewhere in this file) —
+                    # this crashed in production exactly because that list
+                    # got treated as if it were one of our {"mode",...}
+                    # state dicts. Every other value in this loop MUST be
+                    # checked before .get() is called on it.
                     and other_state.get("mode") == "text"
                     and other_state.get("buffer", "").startswith(prefix)
                     for other_id, other_state in message_state.items()
