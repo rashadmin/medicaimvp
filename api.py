@@ -628,7 +628,6 @@ async def _stream_chat(
                     			sessions[session_id]["alerts"] = content
                     	except Exception:
                     		pass
-                    yield _sse(event, payload)
                     if event == "token":
                         tokens_sent = True
                         yield _sse(event, payload)
