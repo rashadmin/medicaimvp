@@ -93,7 +93,11 @@ def _classify_error(exc: Exception) -> tuple[bool, str]:
     inside the assistant's visible response). Log the full exception
     server-side; only ever send the classified, generic message."""
     text = str(exc)
-    logger.warning("agent.astream error: %s", text[:2000])
+    # str(exc) alone (e.g. "'list' object has no attribute 'get'") tells you
+    # WHAT broke but not WHERE — no file/line, no call stack. logger.exception
+    # captures the full traceback so the next occurrence is actually
+    # debuggable instead of a repeat of this same guessing exercise.
+    logger.exception("agent.astream error: %s", text[:2000])
 
     if "RESOURCE_EXHAUSTED" in text or "429" in text or "Too Many Requests" in text:
         return True, "The AI service is temporarily rate-limited."
@@ -171,6 +175,17 @@ def _capture_task_ids(chunk: dict, session_id: str) -> None:
     Scan updates chunks for async_tasks state channel updates.
     This is where deepagents stores { task_id, agent_name, status }.
     """
+    # Every stream_mode this app uses ("updates"/"messages"/"custom") is
+    # expected to hand us a dict wrapper like {"type": ..., "data": ...,
+    # "ns": ...}. That's been assumed everywhere via chunk.get(...) without
+    # ever checking chunk itself — if any chunk ever arrives as something
+    # else (a bare list has been observed from some custom-stream-mode
+    # payloads), chunk.get(...) raises AttributeError, which bubbles up
+    # through agent.astream()'s loop and gets misreported as an "agent"
+    # failure even though it's really our own code. Guard here so an
+    # unexpected shape is just skipped instead of taking the whole turn down.
+    if not isinstance(chunk, dict):
+        return
     if chunk.get("type") != "updates":
         return
 
@@ -217,6 +232,10 @@ def _capture_task_ids(chunk: dict, session_id: str) -> None:
 
 
 def _classify_chunk(chunk: dict, session_id: str, message_state: dict) -> tuple[str, dict] | None:
+    # See matching guard/comment in _capture_task_ids above — chunk itself
+    # was never checked before being .get()'d, only its nested "data".
+    if not isinstance(chunk, dict):
+        return None
     chunk_type = chunk.get("type")
     ns         = chunk.get("ns", ())
     raw_data   = chunk.get("data", {})
@@ -701,8 +720,23 @@ async def _stream_chat(
                         yield _sse(event, payload)
                     else:
                         activity_log.append({"event": event, **payload})
-                _capture_task_ids(chunk, session_id)
-                classified = _classify_chunk(chunk, session_id, message_state)
+                # Our own chunk parsing is defended locally, separate from
+                # the outer try/except around the whole astream() loop.
+                # That outer one exists for genuine upstream failures
+                # (rate limits, dropped connections) and its retry logic
+                # assumes the WHOLE turn needs re-running — that's wrong
+                # for a bug in our own parsing of one chunk, which should
+                # just be logged and skipped so the rest of the turn (and
+                # the model's actual response) still goes through.
+                try:
+                    _capture_task_ids(chunk, session_id)
+                    classified = _classify_chunk(chunk, session_id, message_state)
+                except Exception:
+                    logger.exception(
+                        "chunk parsing error (session=%s) — skipping this chunk",
+                        session_id,
+                    )
+                    classified = None
                 if classified:
                     event, payload = classified
                     if event == "subagent_complete" and payload.get("tool") == "send_alerts":
