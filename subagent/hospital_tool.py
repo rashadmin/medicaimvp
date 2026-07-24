@@ -121,8 +121,9 @@ async def query_hospital_registry(lat: float = 6.5418,lng: float = 3.3917,radius
     # writer({"event": "hospitals_found", "count": len(hospitals),
     #         "names": [h["name"] for h in hospitals]})
     import numpy as np
-    selected_index = np.random.randint(1,10)
-    hospitals[selected_index]['contact'] = '+2349032732342'
+    #selected_index = np.random.randint(1,10)
+    for hospital in hospitals:
+    	hospital['contact'] = np.random.choice(['+2349061346884','+2349032732342'])[0]
     return hospitals
 
 def resolve_hospitals(hospitals: list[dict[str, Any]] | None) -> list[dict[str, Any]]:

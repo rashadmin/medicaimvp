@@ -100,10 +100,20 @@ class EmergencyAnalysis(BaseModel):
     summary:                 str                    = Field(description="One sentence summary")
 
 class ImmediateSteps(BaseModel):
+    narrative: str = Field(
+        description="A short 2-3 sentence acknowledgement: what appears to "
+                     "be happening, that hospitals nearby are being "
+                     "contacted right now, and to call 112 immediately if "
+                     "they haven't. Plain, calm, empathetic language. This "
+                     "must NEVER contain, restate, number, or list any of "
+                     "the quick_steps actions — narrative and quick_steps "
+                     "are two separate outputs shown in two separate places."
+    )
     quick_steps: list[str] = Field(
         description="1-3 short, immediate first-aid actions, derivable ONLY "
                      "from certain_conditions — never from uncertain/speculative "
-                     "ones. Plain language, one action per item, no explanations."
+                     "ones. Plain language, one action per item, no explanations. "
+                     "Never restated inside narrative."
     )
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -360,8 +370,9 @@ Rules:
 @tool
 def assemble_immediate_steps(certain_conditions: list[str], emergency_summary: str) -> dict:
     """
-    Build a SMALL set (max 3) of immediate first-aid actions for the
-    MANDATORY first response, before the clarifying question is answered.
+    Build the MANDATORY first response: a short acknowledgement narrative
+    PLUS a small set (max 3) of immediate first-aid actions, before the
+    clarifying question is answered.
 
     Uses ONLY certain_conditions — never uncertain_dimensions or anything
     speculative. This must never wait on web_searcher results: it draws on
@@ -372,14 +383,18 @@ def assemble_immediate_steps(certain_conditions: list[str], emergency_summary: s
     certain_conditions field. If certain_conditions is empty (nothing is
     certain yet, e.g. "collapsed" alone) — do NOT call this tool at all;
     there is nothing safe to build quick steps from until something is
-    confirmed.
-
-    Args:
-        certain_conditions : certain_conditions from analyse_emergency
-        emergency_summary  : summary from analyse_emergency
+    confirmed. In that case, write your own short acknowledgement text
+    instead (see SYSTEM_PROMPT step 7).
 
     Returns:
-        { "quick_steps": ["step 1", "step 2", ...] }   — max 3, plain language
+        {
+          "narrative":   "<2-3 sentence acknowledgement, no steps in it>",
+          "quick_steps": ["step 1", "step 2", ...],   # max 3, plain language
+        }
+
+    The `narrative` field IS the user-facing acknowledgement for this turn
+    — once this tool is called, do NOT also write your own text response;
+    the backend sends this narrative to the user automatically.
     """
     llm = ChatGoogleGenerativeAI(
         model="gemini-3.1-flash-lite",   # ← check this model name exists
@@ -391,16 +406,29 @@ def assemble_immediate_steps(certain_conditions: list[str], emergency_summary: s
 
     result: ImmediateSteps = llm.invoke(f"""
 A person needs to do something RIGHT NOW, before any more information is
-available. Give 1-3 short, immediate first-aid actions based ONLY on what is
-already certain below — do not guess at anything uncertain.
+available.
 
 Emergency: {emergency_summary}
 Certain conditions: {', '.join(certain_conditions)}
 
+Produce TWO separate things:
+
+1. narrative: a short 2-3 sentence acknowledgement, in this shape —
+   "Your [relationship] has [what happened] — this is critical.
+   Hospitals near you are being contacted right now. Call 112
+   immediately." Plain, calm, empathetic. This must NEVER contain,
+   number, or list any of the quick_steps actions.
+
+2. quick_steps: 1-3 short, immediate first-aid actions based ONLY on
+   what is already certain above — do not guess at anything uncertain.
+
 Rules:
-- Max 3 steps, most urgent first
-- Each step is one short, plain-language sentence — no explanations
+- Max 3 quick_steps, most urgent first
+- Each quick_step is one short, plain-language sentence — no explanations
 - Only actions safe to take with zero additional information
+- If in doubt whether an action needs more context first, leave it out
+- narrative and quick_steps are two SEPARATE outputs, shown in two
+  separate places to the user — never duplicate content between them
 - If in doubt about whether an action needs more context first, leave it out
 """)
     return result.model_dump()
@@ -540,14 +568,39 @@ ON FIRST EMERGENCY MESSAGE
     correct by waiting.
 
 
-7. Write your text response to the user — plain text only, NO question:
+7. Write your text response to the user — SHORT, 2-3 sentences MAXIMUM,
+   plain text only, NO question, NO steps:
    "Your [relationship] has been [emergency summary] — this is critical.
    Hospitals near you are being contacted right now.
    Call 112 immediately."
-   
-   STOP. Do not include any question in this text.
 
-8. THEN call ask_clarifying_question() separately:
+   assemble_immediate_steps has NO narrative field of its own — this text
+   is the ONLY acknowledgement the user sees for this turn. If step 5c
+   called assemble_immediate_steps, its quick_steps render as their own
+   card automatically, straight from the tool result — do NOT also list,
+   number, or restate those actions here. Do not write "1. ... 2. ...
+   3. ..." or "here's what to do right now" followed by a list.
+
+   Example of WRONG text response (DO NOT DO THIS — this is a real bug
+   that has happened, do not repeat it):
+   "Your son has a suspected broken bone — this is critical. Hospitals
+   near you are being contacted right now. Call 112 immediately. To help
+   manage the injury while you wait for help: 1. Keep the injured area
+   still. 2. Do not try to straighten the bone. 3. Apply a cold pack
+   wrapped in a cloth."
+
+   Example of CORRECT text response for the same situation:
+   "Your son has a suspected broken bone — this is critical. Hospitals
+   near you are being contacted right now. Call 112 immediately."
+
+   STOP. Do not include any question or any steps in this text.
+   Write this text response EXACTLY ONCE for this turn — never write an
+   acknowledgement, then write a second, similar, or repeated version of
+   it again later in the same turn (e.g. right before or after calling
+   ask_clarifying_question in step 8). One turn, one short text message.
+
+8. THEN call ask_clarifying_question() separately, with no additional
+   text alongside the tool call — the text was already sent in step 7:
    e.g ask_clarifying_question(
      question="Is [patient] breathing?",
      options=["Yes, breathing normally",
@@ -580,33 +633,32 @@ ON USER ANSWER TO CLARIFYING QUESTION
 4. check_async_task for confirmed and certain searches
    → collect results as they complete
 
-5. Once critical web results are ready:
-   assemble_first_aid_response(web_results, emergency_summary, patient_profile)
+5. Once critical web results are ready, call assemble_first_aid_response
+   ONCE — never call it a second time in the same turn:
+     assemble_first_aid_response(web_results, emergency_summary, patient_profile)
 
+   Its JSON result carries its own `narrative` field — a short 1-2
+   sentence acknowledgement + "hospitals are being contacted" + "call 112"
+   line. The backend sends that narrative to the user automatically as
+   the text for this turn. It is the ONLY acknowledgement text the user
+   sees here.
 
-6. Write a SHORT plain text response — 2-3 sentences MAXIMUM:
-   - One sentence acknowledging the situation
-   - "Hospitals near you are being contacted."
-   - "Call 112 now if you haven't already."
-   
-   ⚠️ DO NOT write steps, do-nots, or watch-for items in your text.
-   ⚠️ DO NOT use markdown headers, bullet points, or numbered lists.
-   ⚠️ The steps will be shown separately as a guidance card — not in your text.
+   ⚠️ Do NOT ALSO write your own separate text response describing the
+   situation, hospitals, or the call-to-action — the tool's narrative IS
+   that response. Writing your own version of it in addition to calling
+   the tool duplicates the same sentences for the user, verbatim.
+   ⚠️ Do NOT write steps, do-nots, or watch-for items anywhere in your
+   own text, ever — those render from the guidance card, straight from
+   the tool result, never from you.
+   ⚠️ Do NOT use markdown headers, bullet points, or numbered lists.
 
-   Example of CORRECT text response:
-   "Your son has been stabbed and is losing a lot of blood — this is critical.
-   Hospitals near you are being contacted right now. Call 112 immediately."
+6. If — and only if — a NEW clarifying question is genuinely needed based
+   on how the situation has developed, call ask_clarifying_question() now,
+   with no additional text alongside it (the narrative already covered
+   the acknowledgement in step 5).
 
-   Example of WRONG text response (DO NOT DO THIS):
-   "### Priority Steps
-   1. Apply pressure to the wound...
-   2. Keep him still..."
-
-7. THEN call assemble_first_aid_response() with the RAG results.
-   This returns the structured guidance card shown to the user separately.
-   The card contains all steps, do-nots, watch-for — so you MUST NOT repeat them in text.
-
-8. THEN call ask_clarifying_question() for the one clarifying question.
+   Otherwise, this turn is complete as soon as assemble_first_aid_response
+   has been called — do not add any further text of your own after it.
 
 
 ════════════════════════════════════════════
@@ -727,6 +779,16 @@ HARD RULES
   contain a field name like "certain_conditions" or "severity", stop —
   that content must never reach the user.
 - NEVER say "hospitals are being alerted" if hospital_notifier failed to launch
+- ONE acknowledgement text per turn — total. Whether it comes from your own
+  writing (first message, step 7) or from a tool's `narrative` field
+  (follow-up, step 5), it is said EXACTLY ONCE. Never write your own
+  version of it and also rely on a tool's narrative in the same turn;
+  never write it twice in any form, even reworded, even split across two
+  separate text messages before/after a tool call in the same turn.
+- NEVER restate priority_steps, quick_steps, do_not, or watch_for content
+  as prose, a numbered list, or bullet points in your own text — those
+  values only ever render from their own card (guidance/quick_steps),
+  never from you.
 - ALWAYS respond in plain language — no medical jargon
 - If web returns no results, use your own medical knowledge
 - This is a live emergency — be fast, calm, and clear
