@@ -20,6 +20,7 @@ GET  /health
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -307,7 +308,27 @@ def _classify_chunk(chunk: dict, session_id: str, message_state: dict) -> tuple[
             # the metadata check above (can't catch a prose-shaped leak),
             # kept only as a stopgap for whatever the primary check misses.
             msg_id = getattr(token, "id", None) or "unknown"
-            state  = message_state.setdefault(msg_id, {"mode": None, "buffer": ""})
+            state  = message_state.setdefault(
+                msg_id,
+                {"mode": None, "buffer": "", "first_attempt": message_state.get("_current_attempt", 0)},
+            )
+
+            # RETRY-REPLAY GUARD: if this exact msg_id already finished
+            # streaming as real user-facing text in a PRIOR attempt (i.e.
+            # it was fully decided as "not a repeat" and flushed), and it's
+            # now showing up again after a retry resumed the graph from the
+            # checkpoint, this is a replay of already-committed state, not
+            # new content — LangGraph resuming a "messages"-mode stream can
+            # re-emit messages already persisted to the checkpoint. Route
+            # it to internal_output instead of streaming the same text to
+            # the user a second (or third) time.
+            if (
+                state.get("dedupe_decided")
+                and not state.get("is_repeat")
+                and state.get("first_attempt") != message_state.get("_current_attempt", 0)
+            ):
+                return "internal_output", {"source": source, "text": content}
+
             state["buffer"] += content
 
             if state["mode"] is None:
@@ -352,6 +373,19 @@ def _classify_chunk(chunk: dict, session_id: str, message_state: dict) -> tuple[
                     and other_state.get("mode") == "text"
                     and other_state.get("buffer", "").startswith(prefix)
                     for other_id, other_state in message_state.items()
+                ) or any(
+                    # CROSS-CHANNEL CHECK: assemble_immediate_steps /
+                    # assemble_first_aid_response's `narrative` field is
+                    # popped and streamed as its own "token" event directly
+                    # from _stream_chat (never passes through this buffer),
+                    # so a model that ALSO writes its own free-text ack
+                    # (against the tool docstring's instruction not to)
+                    # previously slipped past this check entirely — nothing
+                    # here ever compared against it. _stream_chat registers
+                    # every tool narrative it streams into
+                    # message_state["_tool_narratives"]; check that too.
+                    narrative_text.startswith(prefix)
+                    for narrative_text in message_state.get("_tool_narratives", [])
                 )
                 state["dedupe_decided"] = True
                 state["is_repeat"] = is_repeat
@@ -699,9 +733,18 @@ async def _stream_chat(
     # through the same channel — see _classify_chunk for why this exists
     message_state: dict = {}
 
+    # signatures of guidance/quick_steps tool results already streamed this
+    # turn (event name + hash of the full payload, narrative included) —
+    # persists across retry attempts (declared outside the while loop), so
+    # if a retry resumes the graph and replays an already-committed tool
+    # result, it's dropped instead of re-sent as a duplicate narrative +
+    # duplicate card.
+    sent_structured_sigs: set[str] = set()
+
     tokens_sent = False
     attempt     = 0
     while True:
+        message_state["_current_attempt"] = attempt
         try:
             # First attempt runs the turn normally. Retries resume from the
             # checkpointer's last saved state (input=None) instead of
@@ -770,9 +813,27 @@ async def _stream_chat(
                         # "pending narrative" state needed, since both
                         # events are emitted back-to-back here, in order,
                         # before the next chunk is processed.
+                        # REPLAY GUARD: hash the full result (before popping
+                        # narrative) so a retry that resumes the graph and
+                        # re-delivers this same already-committed tool
+                        # result is dropped wholesale — no duplicate
+                        # narrative token, no duplicate card.
+                        sig = event + ":" + hashlib.sha256(
+                            json.dumps(payload, sort_keys=True, default=str).encode()
+                        ).hexdigest()
+                        if sig in sent_structured_sigs:
+                            continue
+                        sent_structured_sigs.add(sig)
+
                         narrative = payload.pop("narrative", "")
                         if narrative:
                             tokens_sent = True
+                            # Register so the free-text dedupe safety net in
+                            # _classify_chunk can catch the model separately
+                            # writing its own version of this same ack (the
+                            # cross-channel gap that let the nose-injury
+                            # message double/triple up).
+                            message_state.setdefault("_tool_narratives", []).append(narrative)
                             yield _sse("token", {
                                 "source": payload.get("source", "supervisor"),
                                 "text":   narrative,
