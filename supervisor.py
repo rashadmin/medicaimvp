@@ -324,20 +324,21 @@ Emergency: {emergency_summary}
 Retrieved first-aid knowledge:
 {web_context}
 
-Format your response as JSON:
+Format your response as JSON with TWO separate sections:
+
 {{
-  "priority_steps": ["step 1", "step 2", ...],   // max 8, most critical first
-  "do_not": ["do not ...", ...],                  // critical warnings
-  "watch_for": ["watch for ...", ...],            // what to monitor
+  "narrative": "One short empathetic sentence + call to action. MAX 2 sentences. NO steps here.",
+  "priority_steps": ["step 1", "step 2", ...],
+  "do_not": ["do not ...", ...],
+  "watch_for": ["watch for ...", ...],
   "reassurance": "one calming sentence",
-  "when_to_update_me": "tell me if X happens"    // what to report back
+  "when_to_update_me": "tell me if X happens"
 }}
 
 Rules:
-- Steps must be simple enough for a non-medical person
-- Most critical actions FIRST
-- Consider patient's age and allergies
-- Short sentences only
+- narrative: conversational, empathetic, SHORT. Never contains steps.
+- priority_steps: numbered actions, NOT in narrative
+- These are two separate outputs — never duplicate content between them
 """)
 
     content = response.content
@@ -582,25 +583,31 @@ ON USER ANSWER TO CLARIFYING QUESTION
 5. Once critical web results are ready:
    assemble_first_aid_response(web_results, emergency_summary, patient_profile)
 
-6. Respond with the assembled first-aid guidance:
-   - Priority steps (numbered, clear)
-   - Do NOTs
-   - What to watch for
-   - Reassurance
-   - "Tell me if anything changes."
 
-7. Respond to user — THIS IS MANDATORY, DO NOT SKIP:
-   Write a message directly to the user containing:
-   a. Brief acknowledgement: "I understand — [summary of emergency]"
-   b. "Nearby hospitals are being alerted."
-   c. Immediate action: "Call 112 now."
-   d. The ONE clarifying question from analyse_emergency
+6. Write a SHORT plain text response — 2-3 sentences MAXIMUM:
+   - One sentence acknowledging the situation
+   - "Hospitals near you are being contacted."
+   - "Call 112 now if you haven't already."
    
-   Example:
-   "Your brother has been stabbed and is having trouble breathing — this is critical.
-   Hospitals near you are being alerted right now.
-   Call 112 immediately if you haven't already.
-   Is he conscious and responding to you?"
+   ⚠️ DO NOT write steps, do-nots, or watch-for items in your text.
+   ⚠️ DO NOT use markdown headers, bullet points, or numbered lists.
+   ⚠️ The steps will be shown separately as a guidance card — not in your text.
+
+   Example of CORRECT text response:
+   "Your son has been stabbed and is losing a lot of blood — this is critical.
+   Hospitals near you are being contacted right now. Call 112 immediately."
+
+   Example of WRONG text response (DO NOT DO THIS):
+   "### Priority Steps
+   1. Apply pressure to the wound...
+   2. Keep him still..."
+
+7. THEN call assemble_first_aid_response() with the RAG results.
+   This returns the structured guidance card shown to the user separately.
+   The card contains all steps, do-nots, watch-for — so you MUST NOT repeat them in text.
+
+8. THEN call ask_clarifying_question() for the one clarifying question.
+
 
 ════════════════════════════════════════════
 YOUTUBE VIDEO SUBAGENT (youtube_subagent)

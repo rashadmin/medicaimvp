@@ -405,11 +405,23 @@ def _classify_chunk(chunk: dict, session_id: str, message_state: dict) -> tuple[
                                     "quick_steps": parsed.get("quick_steps", []),
                                 }
 
+                        # assemble_first_aid_response's JSON now carries a
+                        # `narrative` field (short, prose, empathetic ack +
+                        # call to action) SEPARATE from the structured
+                        # fields — that's the fix for the duplication bug
+                        # where the model's free-text response and this
+                        # tool's structured output said the same thing
+                        # twice. We pull narrative out here so the caller
+                        # (_stream_chat) can flush it as its own `token`
+                        # event, then send everything else as `guidance`
+                        # with narrative already stripped out — the two
+                        # channels never carry the same content.
                         if tool_name == "assemble_first_aid_response":
                             parsed = _safe_json_loads(content)
                             if parsed:
                                 return "guidance", {
                                     "source":            source,
+                                    "narrative":         parsed.get("narrative", ""),
                                     "priority_steps":    parsed.get("priority_steps", []),
                                     "do_not":            parsed.get("do_not", []),
                                     "watch_for":         parsed.get("watch_for", []),
@@ -631,7 +643,28 @@ async def _stream_chat(
                     if event == "token":
                         tokens_sent = True
                         yield _sse(event, payload)
-                    elif event in ("clarifying_question", "guidance", "quick_steps"):
+                    elif event == "guidance":
+                        # assemble_first_aid_response's JSON now carries a
+                        # short `narrative` field alongside the structured
+                        # steps — that's the ONLY prose the user should see
+                        # for this tool result, so it's flushed as its own
+                        # `token` event first (same rendering path as any
+                        # other supervisor text), and THEN the structured
+                        # fields go out as `guidance`, with `narrative`
+                        # already popped off. This is what keeps the two
+                        # channels from ever repeating the same content —
+                        # no separate "pending narrative" state needed,
+                        # since both events are emitted back-to-back here,
+                        # in order, before the next chunk is processed.
+                        narrative = payload.pop("narrative", "")
+                        if narrative:
+                            tokens_sent = True
+                            yield _sse("token", {
+                                "source": payload.get("source", "supervisor"),
+                                "text":   narrative,
+                            })
+                        yield _sse(event, payload)
+                    elif event in ("clarifying_question", "quick_steps"):
                         # these ARE the user-facing answer, just structured
                         # instead of prose — stream live like token, not
                         # batched into activity
@@ -726,7 +759,13 @@ async def chat(request: ChatRequest):
                      appear alongside `question`/`guidance` on a turn (e.g.
                      a short intro sentence) — don't assume it's the ONLY
                      source of user-facing content, just the unstructured
-                     part of it.
+                     part of it. In particular, `guidance` is now ALWAYS
+                     preceded by exactly one `token` event carrying that
+                     tool result's own short `narrative` (a couple of
+                     empathetic + call-to-action sentences) — the model's
+                     own free-text response is instructed not to also
+                     write that content, so this token is the only prose
+                     tied to a guidance card, never duplicated in it.
       clarifying_question — { source, question, options: [...], context }
                      sent ONCE, live, straight from ask_clarifying_question's
                      structured tool result. This is a SEPARATE event from
@@ -768,10 +807,13 @@ async def chat(request: ChatRequest):
                      watch_for: [...], reassurance, when_to_update_me }
                      sent ONCE, live, straight from
                      assemble_first_aid_response's structured tool result —
-                     not re-derived from the model's prose. Map each field
-                     to its own visual treatment (numbered steps, a
-                     "do not" callout, a "watch for" callout, etc.) instead
-                     of parsing markdown headers out of token text.
+                     not re-derived from the model's prose, and no longer
+                     carries a `narrative` field itself (that's popped off
+                     and sent as the preceding `token` event instead — see
+                     above). Map each field to its own visual treatment
+                     (numbered steps, a "do not" callout, a "watch for"
+                     callout, etc.) instead of parsing markdown headers out
+                     of token text.
       activity     — { session_id, events: [...] } sent ONCE, right before
                      `done`. Bundles everything that isn't user-facing:
                      step, tool_call, tool_call_request, web_event,
