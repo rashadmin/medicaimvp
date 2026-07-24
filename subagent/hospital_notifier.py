@@ -41,7 +41,9 @@ Workflow:
 3. Call broadcast_to_hospitals(
      alert_report=<result from step 2>,
      hospitals=<the "hospitals" array from the task JSON, unmodified>,
-     session_id=<from task>
+     session_id=<from task>,
+     lat=<location.lat from the task JSON>,
+     lng=<location.lng from the task JSON>,
    )
 4. Return the result clearly formatted:
 NOTIFICATIONS_SENT: <count>

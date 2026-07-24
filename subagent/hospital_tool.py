@@ -401,6 +401,8 @@ async def broadcast_to_hospitals(
     alert_report: str,
     hospitals:    list[dict[str, Any]],
     session_id:   str,
+    lat: float | None = None,
+    lng:float | None = None,
 ) -> list[dict[str, Any]]:
     """
     Send the alert report to all hospitals simultaneously via asyncio.gather.
@@ -415,7 +417,10 @@ async def broadcast_to_hospitals(
     Returns list of send results per hospital.
     """
     # writer = get_stream_writer()
-    hospitals = await query_hospital_registry()
+    if not hospitals:
+    	if lat is None or lng is None:
+    		raise ValueError("broadcast_to_hospitals: no hospitals list and no lat/lng to look them up")
+    	hospitals = await query_hospital_registry(lat=lat,lng=lng)
     resolved = resolve_hospitals(hospitals)
 
     if not resolved:
