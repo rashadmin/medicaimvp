@@ -273,6 +273,16 @@ async def _lifespan(app: FastAPI):
 app = FastAPI(title="MedicAI Subagent Server (debug)", lifespan=_lifespan)
 
 
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/ok")
