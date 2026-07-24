@@ -232,6 +232,45 @@ def _capture_task_ids(chunk: dict, session_id: str) -> None:
                     ids.append(task_id)
 
 
+# Structural markers of restated guidance: things a short 2-3 sentence
+# acknowledgement should never contain, but a paraphrased priority_steps/
+# do_not/watch_for list reliably does. Kept as compiled patterns since this
+# runs on every streamed chunk.
+_RESTATED_GUIDANCE_PATTERNS = [
+    # Not anchored to a true line-start: the streamed "text"-mode buffer is
+    # plain concatenated token content, not guaranteed to carry the newlines
+    # a rendered markdown view would — a header/list marker earlier tested
+    # with ^...MULTILINE missed real examples that had already lost their
+    # line breaks by the time they reached this buffer.
+    re.compile(r"#{1,6}\s*\w"),            # markdown header, e.g. "### Priority Actions"
+    re.compile(r"\bSTEP\s*\d+\b", re.IGNORECASE),  # "STEP 1", "Step 2"
+    re.compile(r"(?:^|\n)\s*\d+[.)]\s"),   # numbered list: "1. " / "1) "
+    re.compile(r"(?:^|\n)\s*[\*\-•]\s"),   # bullet list
+]
+
+
+def _looks_like_restated_guidance(text: str) -> bool:
+    """Heuristic backstop for the semantic-duplication case the literal
+    prefix/hash dedupe checks in _classify_chunk can't see: the model
+    paraphrasing priority_steps/do_not/watch_for as its own prose instead
+    of the short ack SYSTEM_PROMPT asks for. A paraphrase won't share a
+    prefix with, or hash identically to, the guidance/quick_steps card's
+    structured payload — so it needs its own check, based on shape rather
+    than exact text.
+
+    Deliberately structural, not content-based: a legitimate ack is never
+    supposed to contain headers, numbered/bulleted steps, or the same
+    section label repeated, regardless of phrasing. Two or more "do not" /
+    "watch for" occurrences is also treated as a signal, since a real ack
+    has no reason to use either phrase more than once."""
+    if any(p.search(text) for p in _RESTATED_GUIDANCE_PATTERNS):
+        return True
+    lowered = text.lower()
+    if lowered.count("do not") >= 2 or lowered.count("watch for") >= 2:
+        return True
+    return False
+
+
 def _classify_chunk(chunk: dict, session_id: str, message_state: dict) -> tuple[str, dict] | None:
     # See matching guard/comment in _capture_task_ids above — chunk itself
     # was never checked before being .get()'d, only its nested "data".
@@ -351,16 +390,55 @@ def _classify_chunk(chunk: dict, session_id: str, message_state: dict) -> tuple[
             # ever catches same-turn repeats, never flags a legitimately
             # similar-sounding reply on a later, separate turn.
             #
-            # We hold "text"-mode output back briefly (a short prefix) so we
-            # have enough of it to compare BEFORE committing to streaming it
-            # live — once a message has started streaming to the user we
-            # can't un-send it, so the check has to happen before the first
-            # token of a given message goes out, not after.
+            # This only catches LITERAL repeats (same/near-identical text,
+            # or the model echoing a tool's exact `narrative` string). It
+            # does NOT catch the model paraphrasing the same priority_steps/
+            # do_not/watch_for content in different words/order — e.g.
+            # writing its own "### Priority Actions ... ### Do Not ... ###
+            # Watch For" prose and then a guidance/quick_steps card renders
+            # the same steps again, structurally, right after. Two
+            # differently-worded blocks share no 30-char prefix and hash
+            # differently, so this check alone waves it through. That gap
+            # is what _looks_like_restated_guidance below closes.
+            #
+            # We hold "text"-mode output back briefly so we have enough of
+            # it to compare BEFORE committing to streaming it live — once a
+            # message has started streaming to the user we can't un-send
+            # it, so the check has to happen before the first token of a
+            # given message goes out, not after.
             DEDUPE_PREFIX_LEN = 30
+
+            # STRUCTURAL SAFETY NET: legitimate free-text acks are short
+            # (SYSTEM_PROMPT: "SHORT, 2-3 sentences MAXIMUM, ... NO steps")
+            # and never contain headers, numbered steps, or repeated
+            # do_not/watch_for-style section labels — those only belong in
+            # the guidance/quick_steps card, rendered straight from the
+            # tool's structured output. So a free-text buffer that DOES
+            # contain them is, by construction, restating content that
+            # belongs to that card — a genuine ack could never legitimately
+            # look like this. We keep buffering (silently) past the
+            # DEDUPE_PREFIX_LEN floor, up to GUIDANCE_SNIFF_CAP, so a marker
+            # that shows up later in the message (not in the first 30
+            # chars) still gets caught before anything streams live.
+            GUIDANCE_SNIFF_CAP = 500
+
             if not state.get("dedupe_decided"):
-                if len(state["buffer"]) < DEDUPE_PREFIX_LEN:
+                buffer = state["buffer"]
+
+                if _looks_like_restated_guidance(buffer):
+                    state["dedupe_decided"] = True
+                    state["is_repeat"] = True
+                    return "internal_output", {"source": source, "text": content}
+
+                if len(buffer) < DEDUPE_PREFIX_LEN:
                     return None  # keep buffering silently, decide once we have enough
-                prefix = state["buffer"][:DEDUPE_PREFIX_LEN]
+                if len(buffer) < GUIDANCE_SNIFF_CAP:
+                    # long enough for the literal-prefix check below, but
+                    # still short of the cap — keep buffering silently in
+                    # case a restated-guidance marker is still coming
+                    return None
+
+                prefix = buffer[:DEDUPE_PREFIX_LEN]
                 is_repeat = any(
                     other_id != msg_id
                     and isinstance(other_state, dict)  # message_state also
@@ -391,8 +469,8 @@ def _classify_chunk(chunk: dict, session_id: str, message_state: dict) -> tuple[
                 state["is_repeat"] = is_repeat
                 if not is_repeat:
                     # first time we can emit: flush the whole held-back
-                    # prefix as one token, then stream normally from here
-                    return "token", {"source": source, "text": state["buffer"]}
+                    # buffer as one token, then stream normally from here
+                    return "token", {"source": source, "text": buffer}
 
             if state.get("is_repeat"):
                 return "internal_output", {"source": source, "text": content}
