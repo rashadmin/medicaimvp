@@ -259,7 +259,7 @@ def generate_alert_report(
     """
     llm = ChatGoogleGenerativeAI(
         model="gemini-3.1-flash-lite",
-        google_api_key=os.environ.get("GOOGLE_API_KEY"),
+        google_api_key=os.environ.get("SUBAGENT_GOOGLE_API_KEY"),
         temperature=0,
     )
 
