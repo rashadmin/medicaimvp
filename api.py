@@ -425,7 +425,17 @@ def _classify_chunk(chunk: dict, session_id: str, message_state: dict) -> tuple[
             if not state.get("dedupe_decided"):
                 buffer = state["buffer"]
 
-                if _looks_like_restated_guidance(buffer):
+                # Only treat list/header-shaped text as a restated-guidance
+                # duplicate if a guidance/quick_steps card was actually
+                # assembled THIS turn — otherwise this fires on any
+                # legitimately bulleted reply (e.g. "how will I know if
+                # he's improving" answered with a plain bullet list),
+                # dropping real, novel content into internal_output even
+                # though there's no card anywhere for it to be duplicating.
+                if (
+                    message_state.get("_guidance_emitted_this_turn")
+                    and _looks_like_restated_guidance(buffer)
+                ):
                     state["dedupe_decided"] = True
                     state["is_repeat"] = True
                     return "internal_output", {"source": source, "text": content}
@@ -878,6 +888,13 @@ async def _stream_chat(
                         tokens_sent = True
                         yield _sse(event, payload)
                     elif event in ("guidance", "quick_steps"):
+                        # Flag set BEFORE the dedupe-sig check below (even a
+                        # replayed/duplicate card means a card genuinely ran
+                        # this turn) — this is what _classify_chunk's
+                        # restated-guidance heuristic gates on, so it only
+                        # ever fires when there's an actual card for
+                        # free-text to be duplicating.
+                        message_state["_guidance_emitted_this_turn"] = True
                         # Both assemble_first_aid_response and assemble_
                         # immediate_steps's JSON now carry a short `narrative`
                         # field alongside their structured list — that's the
@@ -960,6 +977,34 @@ async def _stream_chat(
             # surface a clean terminal error and stop.
             yield _sse("error", {"message": safe_message, "retryable": is_retryable})
             return
+
+    # DANGLING-BUFFER FLUSH: a "text"-mode message can finish streaming
+    # before its buffer ever crosses DEDUPE_PREFIX_LEN (30 chars) — e.g. a
+    # short ack like "Okay, understood." — so _classify_chunk never reaches
+    # a dedupe decision and just keeps returning None each time. Once the
+    # astream() loop is done, no more chunks are coming for that message id,
+    # so the buffer would otherwise be silently dropped: sent as neither
+    # `token` nor `internal_output`, just gone. Catch any such states here
+    # and resolve them now that we know the message is actually finished.
+    for msg_id, state in message_state.items():
+        if not isinstance(state, dict) or msg_id == "_current_attempt":
+            continue
+        if state.get("mode") != "text" or state.get("dedupe_decided"):
+            continue
+        buffer = state.get("buffer", "")
+        if not buffer:
+            continue
+        if (
+            message_state.get("_guidance_emitted_this_turn")
+            and _looks_like_restated_guidance(buffer)
+        ):
+            activity_log.append({
+                "event": "internal_output", "source": "supervisor", "text": buffer,
+            })
+            continue
+        tokens_sent = True
+        message_state.setdefault("_tool_narratives", []).append(buffer)
+        yield _sse("token", {"source": "supervisor", "text": buffer})
 
     # final drain — catches anything that completed in the gap between the
     # last agent chunk and here. Anything still running after this point is
