@@ -416,11 +416,16 @@ async def broadcast_to_hospitals(
 
     Returns list of send results per hospital.
     """
+    radius = 5
     # writer = get_stream_writer()
     if not hospitals:
     	if lat is None or lng is None:
     		raise ValueError("broadcast_to_hospitals: no hospitals list and no lat/lng to look them up")
-    	hospitals = await query_hospital_registry(lat=lat,lng=lng)
+    	while radius <=30:
+    		hospitals = await query_hospital_registry(lat=lat,lng=lng,radius=radius)
+    		if len(hospitals)>=5:
+    			break
+    		radius+=5
     resolved = resolve_hospitals(hospitals)
 
     if not resolved:

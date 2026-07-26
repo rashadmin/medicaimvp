@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import uuid
+from datetime import datetime, timezone
 from typing import AsyncGenerator
 
 import httpx
@@ -37,7 +38,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from supervisor import agent, make_config, build_input, checkpointer
+from supervisor import agent, make_config, build_input, checkpointer, estimate_eta_minutes
 
 logger = logging.getLogger("medicai.api")
 
@@ -137,6 +138,29 @@ class ChatRequest(BaseModel):
     message:         str
     location:        Location
     patient_profile: PatientProfile = Field(default_factory=PatientProfile)
+
+
+class HospitalSelection(BaseModel):
+    """Body for POST /session/hospitals/{session_id}/select — the frontend
+    sends the hospital dict the user tapped, as returned by
+    GET /session/hospitals/{session_id}, plus its own travel-time
+    calculation for that hospital if it has one (e.g. from a maps/
+    directions API using the user's live location) — this is preferred
+    over the crude straight-line fallback estimated server-side."""
+    id:          str
+    name:        str
+    address:     str | None   = None
+    distance_km: float | None = None
+    contact:     str | None   = None
+    eta_minutes: float | None = None   # frontend-calculated travel time, if available
+
+
+class EtaUpdate(BaseModel):
+    """Body for POST /session/hospitals/{session_id}/eta — lets the
+    frontend push a refreshed travel-time calculation (e.g. re-run against
+    the user's live location as they move) without changing which
+    hospital is selected."""
+    eta_minutes: float
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -768,6 +792,7 @@ async def _stream_chat(
         message=request.message,
         location=request.location.model_dump(),
         patient_profile=request.patient_profile.model_dump(),
+        selected_hospital=session.get("selected_hospital"),
     )
     config    = make_config(session["thread_id"])
     turn_type = "emergency" if is_new else "conversation"
@@ -1189,6 +1214,7 @@ async def chat(request: ChatRequest):
             "youtube_task_ids": [],
             "hospital_task_ids":[],
             "subagent_status":  {},   # task_id -> {status, tool_calls, final}
+            "selected_hospital": None,
         }
     else:
         session_id = request.session_id
@@ -1333,6 +1359,88 @@ async def get_hospitals(session_id: str):
     #         if a.get("hospital_response", {}).get("accepted")
     #     ],
     # })
+
+
+@app.post("/session/hospitals/{session_id}/select")
+async def select_hospital(session_id: str, selection: HospitalSelection):
+    """
+    Record which hospital the user has chosen to head to.
+
+    Call this when the user taps a hospital from the nearby list returned
+    by GET /session/hospitals/{session_id}. If the frontend has its own
+    travel-time calculation for that hospital (e.g. from a maps/
+    directions API against the user's live location), pass it as
+    eta_minutes — that's used as-is. Otherwise a crude straight-line
+    estimate is computed server-side as a fallback. Either way, this
+    stores a selection timestamp so the supervisor agent can answer
+    "how long until we get there?" on later turns — it reads this back
+    via the [SELECTED_HOSPITAL] block injected into its context on every
+    subsequent /chat call, and re-derives the *current* remaining time
+    (accounting for elapsed time) itself.
+
+    No ambulance/medical service is dispatched here — this only tells the
+    agent which hospital the user is now heading to on their own.
+
+    Body: { id, name, address?, distance_km?, contact?, eta_minutes? }
+
+    Response:
+    {
+      "status": "ok",
+      "selected_hospital": {
+        id, name, address, distance_km, contact,
+        "eta_minutes":  <frontend-supplied, or straight-line fallback>,
+        "selected_at":  "<ISO timestamp>"
+      }
+    }
+    """
+    session = sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found.")
+
+    selected = selection.model_dump()
+    if selected.get("eta_minutes") is None:
+        selected["eta_minutes"] = estimate_eta_minutes(selection.distance_km)
+    selected["selected_at"] = datetime.now(timezone.utc).isoformat()
+
+    session["selected_hospital"] = selected
+
+    return JSONResponse({"status": "ok", "selected_hospital": selected})
+
+
+@app.post("/session/hospitals/{session_id}/eta")
+async def refresh_hospital_eta(session_id: str, update: EtaUpdate):
+    """
+    Push a refreshed travel-time calculation for the already-selected
+    hospital, without changing which hospital is selected.
+
+    Use this as the user travels and the frontend recomputes ETA against
+    their live location (traffic conditions change, they may take a
+    different route, etc.). This resets the "selected_at" anchor to now,
+    so the supervisor's elapsed-time decay restarts from this fresh
+    number rather than compounding against the original estimate.
+
+    404s if no hospital has been selected yet for this session — select
+    one first via POST /session/hospitals/{session_id}/select.
+    """
+    session = sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    if not session.get("selected_hospital"):
+        raise HTTPException(status_code=404, detail="No hospital selected for this session yet.")
+
+    session["selected_hospital"]["eta_minutes"] = update.eta_minutes
+    session["selected_hospital"]["selected_at"] = datetime.now(timezone.utc).isoformat()
+
+    return JSONResponse({"status": "ok", "selected_hospital": session["selected_hospital"]})
+
+
+@app.get("/session/hospitals/{session_id}/selected")
+async def get_selected_hospital(session_id: str):
+    """Get the hospital the user has selected for this session, if any."""
+    session = sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    return JSONResponse({"selected_hospital": session.get("selected_hospital")})
 
 
 @app.get("/sessions")

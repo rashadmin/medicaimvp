@@ -64,6 +64,8 @@ from __future__ import annotations
 import json
 import os
 
+from datetime import datetime, timezone
+
 from dotenv import load_dotenv
 load_dotenv()
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -71,6 +73,16 @@ from langchain_core.tools import tool
 from langgraph.checkpoint.memory import MemorySaver
 from pydantic import BaseModel, Field
 from deepagents import create_deep_agent, AsyncSubAgent
+
+# Straight-line-distance ETA estimate — used until/unless a real routing
+# API is wired in. Conservative average speed for busy city traffic.
+AVG_URBAN_SPEED_KMH = 25.0
+
+
+def estimate_eta_minutes(distance_km: float | None, avg_speed_kmh: float = AVG_URBAN_SPEED_KMH) -> float:
+    if not distance_km or distance_km <= 0:
+        return 5.0
+    return round((distance_km / avg_speed_kmh) * 60, 1)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -102,12 +114,13 @@ class EmergencyAnalysis(BaseModel):
 class ImmediateSteps(BaseModel):
     narrative: str = Field(
         description="A short 2-3 sentence acknowledgement: what appears to "
-                     "be happening, that hospitals nearby are being "
-                     "contacted right now, and to call 112 immediately if "
-                     "they haven't. Plain, calm, empathetic language. This "
-                     "must NEVER contain, restate, number, or list any of "
-                     "the quick_steps actions — narrative and quick_steps "
-                     "are two separate outputs shown in two separate places."
+                     "be happening, that nearby hospitals are being alerted "
+                     "so they can expect the patient, and a prompt to pick "
+                     "which hospital to head to from the nearby list. Plain, "
+                     "calm, empathetic language. This must NEVER contain, "
+                     "restate, number, or list any of the quick_steps "
+                     "actions — narrative and quick_steps are two separate "
+                     "outputs shown in two separate places."
     )
     quick_steps: list[str] = Field(
         description="1-3 short, immediate first-aid actions, derivable ONLY "
@@ -410,6 +423,10 @@ def assemble_immediate_steps(certain_conditions: list[str], emergency_summary: s
     the model's own medical knowledge so it can run immediately alongside
     hospital_notifier, without delaying the mandatory first reply.
 
+    Note: no ambulance/medical service is being dispatched — the user is
+    transporting the patient to a hospital themselves. hospital_notifier
+    only alerts nearby hospitals so they can expect the patient's arrival.
+
     Call this once, right after analyse_emergency, using its
     certain_conditions field. If certain_conditions is empty (nothing is
     certain yet, e.g. "collapsed" alone) — do NOT call this tool at all;
@@ -446,9 +463,10 @@ Produce TWO separate things:
 
 1. narrative: a short 2-3 sentence acknowledgement, in this shape —
    "Your [relationship] has [what happened] — this is critical.
-   Hospitals near you are being contacted right now. Call 112
-   immediately." Plain, calm, empathetic. This must NEVER contain,
-   number, or list any of the quick_steps actions.
+   Nearby hospitals are being alerted so they can expect you. Pick
+   which hospital you'd like to head to from the list." Plain, calm,
+   empathetic. This must NEVER contain, number, or list any of the
+   quick_steps actions.
 
 2. quick_steps: 1-3 short, immediate first-aid actions based ONLY on
    what is already certain above — do not guess at anything uncertain.
@@ -463,6 +481,72 @@ Rules:
 - If in doubt about whether an action needs more context first, leave it out
 """)
     return result.model_dump()
+
+
+@tool
+def get_selected_hospital_eta(selected_hospital: dict) -> dict:
+    """
+    Compute how long is left, RIGHT NOW, until the user reaches the hospital
+    they've already chosen to go to. Adjusts for time elapsed since selection
+    — not just a stale one-time estimate.
+
+    Call this when the user asks something like "how long till we get
+    there?", "how far is it?", "what's our ETA?", "are we close?" — but
+    ONLY if [SELECTED_HOSPITAL] is present and non-empty in your context.
+    If no hospital has been selected yet, do NOT call this tool — instead
+    tell the user to pick one from the nearby hospitals list first.
+
+    Args:
+        selected_hospital: pass the [SELECTED_HOSPITAL] dict from your
+            context through EXACTLY as given. Expected keys: name,
+            distance_km, eta_minutes (the travel time known at selection
+            time — ideally the frontend's own routing/maps calculation,
+            falling back to a straight-line estimate if that wasn't
+            available), selected_at (ISO timestamp of when it was set).
+
+    Returns:
+        {
+          "hospital_name":         str,
+          "distance_km":           float | None,
+          "remaining_eta_minutes": float,   # floored at 0
+          "note":                  str,     # caveat about estimate accuracy
+        }
+
+    Always mention this is an estimate somewhere in your reply — briefly,
+    don't dwell on it. (If eta_minutes came from the frontend's own
+    routing calculation it's already fairly accurate; if it fell back to
+    a straight-line estimate it's rougher — either way, keep the caveat
+    short and don't speculate about which source it came from.)
+    """
+    name        = selected_hospital.get("name", "the selected hospital")
+    distance_km = selected_hospital.get("distance_km")
+    initial_eta = selected_hospital.get("eta_minutes")
+    if initial_eta is None:
+        initial_eta = estimate_eta_minutes(distance_km)
+    selected_at = selected_hospital.get("selected_at")
+
+    elapsed_minutes = 0.0
+    if selected_at:
+        try:
+            selected_dt = datetime.fromisoformat(str(selected_at).replace("Z", "+00:00"))
+            now = datetime.now(timezone.utc)
+            elapsed_minutes = max(0.0, (now - selected_dt).total_seconds() / 60)
+        except Exception:
+            elapsed_minutes = 0.0
+
+    remaining = max(0.0, round(initial_eta - elapsed_minutes, 1))
+
+    return {
+        "hospital_name":         name,
+        "distance_km":           distance_km,
+        "remaining_eta_minutes": remaining,
+        "note": (
+            "Estimate based on travel time known at selection — refined "
+            "by the frontend's own routing calculation when available, "
+            "otherwise a rough straight-line approximation. Treat as "
+            "approximate either way."
+        ),
+    }
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -535,7 +619,8 @@ ON FIRST EMERGENCY MESSAGE
    - [ ] Analyse emergency
    - [ ] Launch certain web searches
    - [ ] Launch speculative web searches
-   - [ ] Launch hospital notifier
+   - [ ] Launch hospital notifier (to alert hospitals, not dispatch help)
+   - [ ] Prompt user to pick a hospital from the nearby list
    - [ ] Ask clarifying question
 
 2. analyse_emergency(raw_message=<message>)
@@ -602,8 +687,15 @@ ON FIRST EMERGENCY MESSAGE
 7. Write your text response to the user — SHORT, 2-3 sentences MAXIMUM,
    plain text only, NO question, NO steps:
    "Your [relationship] has been [emergency summary] — this is critical.
-   Hospitals near you are being contacted right now.
-   Call 112 immediately."
+   Nearby hospitals are being alerted so they can expect you.
+   Pick which hospital you'd like to head to from the list below."
+
+   Do NOT tell the user to call emergency services (e.g. 112) here — the
+   user is transporting the patient to hospital themselves, not waiting
+   for one to be dispatched to them. Only mention calling emergency
+   services as a fallback if you are genuinely unable to keep assisting
+   (e.g. a tool/system failure blocks you from giving guidance) — see
+   HARD RULES.
 
    assemble_immediate_steps has NO narrative field of its own — this text
    is the ONLY acknowledgement the user sees for this turn. If step 5c
@@ -621,8 +713,9 @@ ON FIRST EMERGENCY MESSAGE
    wrapped in a cloth."
 
    Example of CORRECT text response for the same situation:
-   "Your son has a suspected broken bone — this is critical. Hospitals
-   near you are being contacted right now. Call 112 immediately."
+   "Your son has a suspected broken bone — this is critical. Nearby
+   hospitals are being alerted so they can expect you. Pick which
+   hospital you'd like to head to from the list below."
 
    STOP. Do not include any question or any steps in this text.
    Write this text response EXACTLY ONCE for this turn — never write an
@@ -674,10 +767,11 @@ ON USER ANSWER TO CLARIFYING QUESTION
      assemble_first_aid_response(web_results, emergency_summary, patient_profile)
 
    Its JSON result carries its own `narrative` field — a short 1-2
-   sentence acknowledgement + "hospitals are being contacted" + "call 112"
-   line. The backend sends that narrative to the user automatically as
-   the text for this turn. It is the ONLY acknowledgement text the user
-   sees here.
+   sentence acknowledgement + a line noting nearby hospitals are being
+   alerted to expect the patient + (if not already selected) a prompt to
+   pick which hospital to head to. The backend sends that narrative to
+   the user automatically as the text for this turn. It is the ONLY
+   acknowledgement text the user sees here.
 
    ⚠️ Do NOT ALSO write your own separate text response describing the
    situation, hospitals, or the call-to-action — the tool's narrative IS
@@ -766,11 +860,27 @@ For QUESTIONS about technique:
   - Respond with text from web result
   - Launch youtube_searcher for the technique in background
 
-For HOSPITAL STATUS questions ("are hospitals coming?", "who confirmed?"):
+For HOSPITAL STATUS questions ("which hospitals were alerted?", "who can take us?"):
   - check_async_task for the hospital_notifier task_id
-  - Report: how many notified, which accepted, which pending
-  - Example: "2 hospitals have been alerted. Gbagada General confirmed they
-              can receive the patient. Still waiting on R-Jolad."
+  - Report: how many notified, which can receive the patient, which pending
+  - Example: "2 hospitals have been alerted. Gbagada General says they're
+              ready to receive the patient. Still waiting on R-Jolad."
+  - Remember: no ambulance is being sent — this is about which hospitals
+    are prepared for the user's own arrival, not a dispatch confirmation.
+
+For HOSPITAL SELECTION & ETA questions ("how long till we get there?",
+"how far is it?", "what's our ETA?", "which hospital did I pick?"):
+  - Check your context for a [SELECTED_HOSPITAL] block.
+  - If [SELECTED_HOSPITAL] is present: call
+    get_selected_hospital_eta(selected_hospital=<that dict, unmodified>)
+    and answer plainly from its result, e.g. "You're about 12 minutes
+    from Gbagada General Hospital." Briefly note it's an estimate, not
+    live traffic routing — don't dwell on the caveat.
+  - If [SELECTED_HOSPITAL] is absent or empty: tell the user to pick a
+    hospital from the nearby list first — do NOT guess a distance or ETA.
+  - A hospital is selected by the user tapping it in the app (handled by
+    the backend, not by you) — you only ever read the result from
+    [SELECTED_HOSPITAL] in your context; you never set it yourself.
 
 ════════════════════════════════════════════
 PARALLEL LAUNCH RULES
@@ -815,6 +925,18 @@ HARD RULES
   contain a field name like "certain_conditions" or "severity", stop —
   that content must never reach the user.
 - NEVER say "hospitals are being alerted" if hospital_notifier failed to launch
+- NEVER instruct the user to call emergency services (e.g. "call 112") as
+  standard guidance — no ambulance/medical service is being dispatched;
+  the user is transporting the patient to a hospital themselves. Only
+  fall back to suggesting they call emergency services if you are
+  genuinely unable to keep assisting them (e.g. a tool or system failure
+  blocks you from giving guidance) — that is the one exception.
+- Frame hospital_notifier's purpose as alerting hospitals so they can
+  expect the patient's arrival and prepare — never as summoning help to
+  come to the user.
+- For questions about ETA/travel time, only answer using
+  get_selected_hospital_eta and only if [SELECTED_HOSPITAL] is present in
+  context — never fabricate a distance or time.
 - ONE acknowledgement text per turn — total. Whether it comes from your own
   writing (first message, step 7) or from a tool's `narrative` field
   (follow-up, step 5), it is said EXACTLY ONCE. Never write your own
@@ -860,7 +982,7 @@ llm = ChatGoogleGenerativeAI(
 
 agent = create_deep_agent(
     model=llm,
-    tools=[analyse_emergency, resolve_uncertainty, assemble_first_aid_response, assemble_immediate_steps, ask_clarifying_question],
+    tools=[analyse_emergency, resolve_uncertainty, assemble_first_aid_response, assemble_immediate_steps, ask_clarifying_question, get_selected_hospital_eta],
     system_prompt=SYSTEM_PROMPT,
     subagents=[web_searcher, youtube_subagent, hospital_notifier],  # ← added
     checkpointer=checkpointer,
@@ -884,15 +1006,19 @@ def build_input(
     location: dict,
     patient_profile: dict,
     prior_messages: list | None = None,
+    selected_hospital: dict | None = None,
 ) -> dict:
     content = (
         f"{message}\n\n"
         f"[LOCATION]\n{json.dumps(location, indent=2)}\n\n"
         f"[PATIENT_PROFILE]\n{json.dumps(patient_profile, indent=2)}"
     )
+    if selected_hospital:
+        content += f"\n\n[SELECTED_HOSPITAL]\n{json.dumps(selected_hospital, indent=2)}"
     messages = (prior_messages or []) + [{"role": "user", "content": content}]
     return {
-        "messages":        messages,
-        "location":        location,
-        "patient_profile": patient_profile,
+        "messages":          messages,
+        "location":          location,
+        "patient_profile":   patient_profile,
+        "selected_hospital": selected_hospital,
     }
