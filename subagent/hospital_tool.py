@@ -422,7 +422,7 @@ async def broadcast_to_hospitals(
     	if lat is None or lng is None:
     		raise ValueError("broadcast_to_hospitals: no hospitals list and no lat/lng to look them up")
     	while radius <=30:
-    		hospitals = await query_hospital_registry(lat=lat,lng=lng,radius=radius)
+    		hospitals = await query_hospital_registry(lat=lat,lng=lng,radius_km=radius)
     		if len(hospitals)>=5:
     			break
     		radius+=5
