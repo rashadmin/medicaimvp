@@ -233,16 +233,27 @@ Respond ONLY as JSON:
         }
 
 class ClarifyingQuestion(BaseModel):
-    question: str        = Field(description="The question to ask the user")
-    options:  list[str]  = Field(description="Preset answer options e.g. ['Yes', 'No']")
-    context:  str        = Field(description="Brief context for why this matters medically")
+    question:          str        = Field(description="The question to ask the user")
+    options:           list[str]  = Field(description="Preset answer options e.g. ['Yes', 'No']")
+    context:           str        = Field(description="Brief context for why this matters medically")
+    suggested_replies: list[str]  = Field(
+        default_factory=list,
+        description=(
+            "2-4 short, tappable free-text reply options, contextual to THIS "
+            "question — phrased the way a person at the scene would actually "
+            "type/say them, e.g. for 'Is the person breathing?' -> "
+            "['He's breathing now', 'Still not breathing', 'Breathing but "
+            "very slowly']. Distinct from `options` (fixed buttons)."
+        ),
+    )
 
 
 @tool
 def ask_clarifying_question(
-    question: str,
-    options:  list[str],
-    context:  str = "",
+    question:          str,
+    options:           list[str],
+    context:           str = "",
+    suggested_replies: list[str] | None = None,
 ) -> dict:
     """
     Ask the user a clarifying question with preset options (buttons).
@@ -256,29 +267,40 @@ def ask_clarifying_question(
                    ["Conscious", "Unconscious"] or
                    ["Chest pain", "Shortness of breath", "Both"]
         context  : why this matters e.g. "This determines if CPR is needed"
+        suggested_replies : 2-4 short, natural-language reply shortcuts
+                   specific to THIS question (e.g. "He's breathing now",
+                   "Still not breathing") — NOT a generic Yes/No restatement
+                   of `options`. Omit or leave empty only if no good
+                   contextual replies come to mind; never fabricate filler.
 
     Examples:
         ask_clarifying_question(
             question="Is the person breathing?",
             options=["Yes, breathing", "No, not breathing", "Gasping/irregular"],
-            context="Breathing status determines if CPR is needed immediately"
+            context="Breathing status determines if CPR is needed immediately",
+            suggested_replies=["He's breathing now", "Still not breathing",
+                                "Breathing but very slowly"]
         )
         ask_clarifying_question(
             question="Is the person conscious?",
             options=["Yes, conscious", "No, unconscious"],
-            context="Consciousness level affects recovery position"
+            context="Consciousness level affects recovery position",
+            suggested_replies=["He's awake and talking", "Still unconscious"]
         )
         ask_clarifying_question(
             question="Where is the wound?",
             options=["Chest", "Abdomen", "Limb", "Head/neck"],
-            context="Location determines bleeding control approach"
+            context="Location determines bleeding control approach",
+            suggested_replies=["It's on his chest", "It's on his leg",
+                                "There are multiple wounds"]
         )
     """
     return {
-        "question": question,
-        "options":  options,
-        "context":  context,
-        "type":     "clarifying_question",
+        "question":          question,
+        "options":           options,
+        "context":           context,
+        "suggested_replies": suggested_replies or [],
+        "type":              "clarifying_question",
     }
 
 
@@ -302,6 +324,7 @@ def assemble_first_aid_response(
     - Do-nots
     - Reassurance
     - What to watch for
+    - Contextual suggested replies for the user's next message
     """
     llm = ChatGoogleGenerativeAI(
     model="gemini-3.1-flash-lite",   # ← check this model name exists
@@ -342,13 +365,20 @@ Format your response as JSON with TWO separate sections:
   "do_not": ["do not ...", ...],
   "watch_for": ["watch for ...", ...],
   "reassurance": "one calming sentence",
-  "when_to_update_me": "tell me if X happens"
+  "when_to_update_me": "tell me if X happens",
+  "suggested_replies": ["short reply 1", "short reply 2", ...]
 }}
 
 Rules:
 - narrative: conversational, empathetic, SHORT. Never contains steps.
 - priority_steps: numbered actions, NOT in narrative
-- These are two separate outputs — never duplicate content between them
+- suggested_replies: 2-4 short, natural-language things the person at the
+  scene might say next, contextual to `when_to_update_me` and the current
+  situation (e.g. "He's breathing better now", "No change yet", "It's
+  gotten worse") — NOT a generic yes/no. These become tappable shortcuts
+  for their next message, so phrase them the way someone would actually
+  speak, not like a form field.
+- These are separate outputs — never duplicate content between them
 """)
 
     content = response.content
@@ -364,6 +394,7 @@ Rules:
             "watch_for":      [],
             "reassurance":    "Help is on the way.",
             "when_to_update_me": "Tell me if anything changes.",
+            "suggested_replies": ["Something's changed", "No change yet"],
         }
 
 
@@ -606,8 +637,13 @@ ON FIRST EMERGENCY MESSAGE
      options=["Yes, breathing normally",
               "No, not breathing",
               "Breathing but very slowly"],
-     context="This determines if CPR is needed right now"
+     context="This determines if CPR is needed right now",
+     suggested_replies=["He's breathing normally",
+                         "Still not breathing",
+                         "Breathing very slowly"]
    )
+   Always include suggested_replies, contextual to THIS question — not a
+   restatement of Yes/No.
 
 The question renders as buttons in the UI — separate from your text.
 Never write the question in your text message.

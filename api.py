@@ -588,10 +588,11 @@ def _classify_chunk(chunk: dict, session_id: str, message_state: dict) -> tuple[
                             parsed = _safe_json_loads(content)
                             if parsed:
                                 return "clarifying_question", {
-                                    "source":   source,
-                                    "question": parsed.get("question", ""),
-                                    "options":  parsed.get("options", []),
-                                    "context":  parsed.get("context", ""),
+                                    "source":            source,
+                                    "question":          parsed.get("question", ""),
+                                    "options":           parsed.get("options", []),
+                                    "context":           parsed.get("context", ""),
+                                    "suggested_replies": parsed.get("suggested_replies", []),
                                 }
 
                         # assemble_first_aid_response already returns fully
@@ -650,6 +651,7 @@ def _classify_chunk(chunk: dict, session_id: str, message_state: dict) -> tuple[
                                     "watch_for":         parsed.get("watch_for", []),
                                     "reassurance":       parsed.get("reassurance", ""),
                                     "when_to_update_me": parsed.get("when_to_update_me", ""),
+                                    "suggested_replies": parsed.get("suggested_replies", []),
                                 }
 
                         return "subagent_complete", {
@@ -1075,7 +1077,8 @@ async def chat(request: ChatRequest):
                      own free-text response is instructed not to also
                      write that content, so this token is the only prose
                      tied to a guidance card, never duplicated in it.
-      clarifying_question — { source, question, options: [...], context }
+      clarifying_question — { source, question, options: [...], context,
+                     suggested_replies: [...] }
                      sent ONCE, live, straight from ask_clarifying_question's
                      structured tool result. This is a SEPARATE event from
                      the preceding `token` text — the model's text response
@@ -1087,6 +1090,12 @@ async def chat(request: ChatRequest):
                      /chat message's `message` field. `context` is a short
                      line on why the question matters medically (e.g. "This
                      determines if CPR is needed") — optional to display.
+                     `suggested_replies` is a separate list of 2-4 short,
+                     natural-language reply shortcuts contextual to THIS
+                     question (not a restatement of `options`) — meant as
+                     tappable shortcuts for the free-text input rather than
+                     the button row. Can be empty; never fabricate a
+                     fallback if so.
       quick_steps  — { source, quick_steps: [...] } sent ONCE, live, on the
                      FIRST message only — straight from
                      assemble_immediate_steps's structured tool result, and
@@ -1117,7 +1126,8 @@ async def chat(request: ChatRequest):
                      is an optimization for the common case, not a
                      replacement for that fallback.
       guidance     — { source, priority_steps: [...], do_not: [...],
-                     watch_for: [...], reassurance, when_to_update_me }
+                     watch_for: [...], reassurance, when_to_update_me,
+                     suggested_replies: [...] }
                      sent ONCE, live, straight from
                      assemble_first_aid_response's structured tool result —
                      not re-derived from the model's prose, and no longer
@@ -1126,7 +1136,13 @@ async def chat(request: ChatRequest):
                      above). Map each field to its own visual treatment
                      (numbered steps, a "do not" callout, a "watch for"
                      callout, etc.) instead of parsing markdown headers out
-                     of token text.
+                     of token text. `suggested_replies` is 2-4 short,
+                     natural-language reply shortcuts contextual to
+                     `when_to_update_me` and the current situation (e.g.
+                     "He's breathing better now", "No change yet") — same
+                     per-turn, non-accumulating shortcut list as on
+                     `clarifying_question`, just without a fixed `options`
+                     counterpart here. Can be empty.
       activity     — { session_id, events: [...] } sent ONCE, right before
                      `done`. Bundles everything that isn't user-facing:
                      step, tool_call, tool_call_request, web_event,
