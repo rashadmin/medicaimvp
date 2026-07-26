@@ -271,6 +271,35 @@ def _looks_like_restated_guidance(text: str) -> bool:
     return False
 
 
+DEDUPE_PREFIX_LEN = 30
+GUIDANCE_SNIFF_CAP = 500
+
+
+def _is_repeat_text(buffer: str, message_state: dict, self_msg_id: str) -> bool:
+    """Shared duplicate-detection: is `buffer` a repeat of (a) another
+    text-mode message already streamed this turn, or (b) a narrative
+    already popped and sent as `token` by the guidance/quick_steps branch
+    (the cross-channel case — a model writing its own free-text echo of a
+    tool's narrative, despite being told not to). Used both mid-stream
+    (once a buffer reaches GUIDANCE_SNIFF_CAP) and at the end-of-turn
+    dangling-buffer flush, on whatever length buffer we actually got —
+    a short buffer just compares its full length instead of a 30-char
+    prefix, since there's nothing more coming to wait for at that point."""
+    if not buffer:
+        return False
+    prefix = buffer[:DEDUPE_PREFIX_LEN]
+    return any(
+        other_id != self_msg_id
+        and isinstance(other_state, dict)
+        and other_state.get("mode") == "text"
+        and other_state.get("buffer", "").startswith(prefix)
+        for other_id, other_state in message_state.items()
+    ) or any(
+        narrative_text.startswith(prefix)
+        for narrative_text in message_state.get("_tool_narratives", [])
+    )
+
+
 def _classify_chunk(chunk: dict, session_id: str, message_state: dict) -> tuple[str, dict] | None:
     # See matching guard/comment in _capture_task_ids above — chunk itself
     # was never checked before being .get()'d, only its nested "data".
@@ -448,33 +477,7 @@ def _classify_chunk(chunk: dict, session_id: str, message_state: dict) -> tuple[
                     # case a restated-guidance marker is still coming
                     return None
 
-                prefix = buffer[:DEDUPE_PREFIX_LEN]
-                is_repeat = any(
-                    other_id != msg_id
-                    and isinstance(other_state, dict)  # message_state also
-                    # holds non-per-message entries (e.g. the list under
-                    # "pending_subagent_types" set elsewhere in this file) —
-                    # this crashed in production exactly because that list
-                    # got treated as if it were one of our {"mode",...}
-                    # state dicts. Every other value in this loop MUST be
-                    # checked before .get() is called on it.
-                    and other_state.get("mode") == "text"
-                    and other_state.get("buffer", "").startswith(prefix)
-                    for other_id, other_state in message_state.items()
-                ) or any(
-                    # CROSS-CHANNEL CHECK: assemble_immediate_steps /
-                    # assemble_first_aid_response's `narrative` field is
-                    # popped and streamed as its own "token" event directly
-                    # from _stream_chat (never passes through this buffer),
-                    # so a model that ALSO writes its own free-text ack
-                    # (against the tool docstring's instruction not to)
-                    # previously slipped past this check entirely — nothing
-                    # here ever compared against it. _stream_chat registers
-                    # every tool narrative it streams into
-                    # message_state["_tool_narratives"]; check that too.
-                    narrative_text.startswith(prefix)
-                    for narrative_text in message_state.get("_tool_narratives", [])
-                )
+                is_repeat = _is_repeat_text(buffer, message_state, msg_id)
                 state["dedupe_decided"] = True
                 state["is_repeat"] = is_repeat
                 if not is_repeat:
@@ -994,10 +997,18 @@ async def _stream_chat(
         buffer = state.get("buffer", "")
         if not buffer:
             continue
-        if (
+        is_restated_guidance = (
             message_state.get("_guidance_emitted_this_turn")
             and _looks_like_restated_guidance(buffer)
-        ):
+        )
+        # Same repeat check used mid-stream (cross-message-id prefix match,
+        # plus the cross-channel match against already-sent tool
+        # narratives) — this is what was missing here before, and it's
+        # exactly what let a short free-text echo of a narrative (too
+        # short to ever reach GUIDANCE_SNIFF_CAP mid-stream) get flushed
+        # as a brand-new, duplicate `token` instead of being recognized as
+        # a repeat.
+        if is_restated_guidance or _is_repeat_text(buffer, message_state, msg_id):
             activity_log.append({
                 "event": "internal_output", "source": "supervisor", "text": buffer,
             })
