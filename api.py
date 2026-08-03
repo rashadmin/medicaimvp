@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -33,9 +34,9 @@ import httpx
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from supervisor import agent, make_config, build_input, checkpointer, estimate_eta_minutes
@@ -69,6 +70,41 @@ SUBAGENT_MAX_WAIT  = float(os.getenv("SUBAGENT_MAX_WAIT", "180"))
 # treats any read failure as "not ready yet" and tries again next tick).
 MAX_MODEL_RETRIES     = int(os.getenv("MAX_MODEL_RETRIES", "2"))
 MODEL_RETRY_BASE_DELAY = float(os.getenv("MODEL_RETRY_BASE_DELAY", "1.5"))
+
+
+# ── WhatsApp Cloud API config ──────────────────────────────────────────────
+# Same LangGraph/agent backend as /chat — this is a second front door onto
+# the exact same _stream_chat() turn logic, just translating SSE frames
+# into WhatsApp messages instead of streaming them to a browser.
+WHATSAPP_VERIFY_TOKEN    = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
+WHATSAPP_APP_SECRET      = os.getenv("META_APP_SECRET", "")
+WHATSAPP_ACCESS_TOKEN    = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
+WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
+WHATSAPP_GRAPH_VERSION   = os.getenv("WHATSAPP_GRAPH_VERSION", "v21.0")
+WHATSAPP_GRAPH_URL       = f"https://graph.facebook.com/{WHATSAPP_GRAPH_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+
+# phone number ("2348012345678") -> session_id. In-memory like `sessions`
+# above — fine for a pilot on a single Render instance, but move this (and
+# `sessions`) to Redis/Postgres before you rely on it surviving a restart,
+# since a Render free/starter dyno recycling mid-conversation would
+# silently drop every in-flight WhatsApp thread.
+whatsapp_sessions: dict[str, str] = {}
+
+# phone number -> emergency text received before we had a location for
+# them. WhatsApp has no equivalent of the frontend's "ask for location on
+# page load" — we have to request it conversationally on the first
+# message, then resume once the location share arrives.
+whatsapp_pending_message: dict[str, str] = {}
+
+# phone number -> the exact option strings for the clarifying_question
+# currently on offer, so a tapped WhatsApp button (title truncated to 20
+# chars by WhatsApp itself) can be resolved back to the full original
+# option text before it's sent into the agent as the next turn's message.
+whatsapp_pending_options: dict[str, list[str]] = {}
+
+# WhatsApp message ids already processed — Meta retries POSTs that don't
+# get a fast 200, so the same message can arrive more than once.
+seen_whatsapp_message_ids: set[str] = set()
 
 
 # Tool calls that mark a real, user-noticeable wait between turns. When the
@@ -1062,6 +1098,394 @@ async def _stream_chat(
         yield _sse("activity", {"session_id": session_id, "events": activity_log})
 
     yield _sse("done", {"session_id": session_id, "turn_type": turn_type})
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  WHATSAPP — send helpers
+# ════════════════════════════════════════════════════════════════════════════
+
+async def _wa_send_text(to: str, body: str) -> None:
+    """Plain text message. WhatsApp caps body at 4096 chars — truncate
+    rather than let the Graph API reject the whole call."""
+    if not body:
+        return
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"body": body[:4096]},
+    }
+    headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(WHATSAPP_GRAPH_URL, headers=headers, json=payload)
+        if resp.status_code >= 400:
+            logger.error("WhatsApp send failed (%s): %s", resp.status_code, resp.text[:500])
+
+
+async def _wa_send_buttons(to: str, body: str, options: list[str]) -> None:
+    """Up to 3 tappable reply buttons — used for clarifying_question when
+    there are 3 or fewer options. Button titles are capped at 20 chars by
+    WhatsApp itself, so the FULL option text is stashed in
+    whatsapp_pending_options and recovered by id when the button is
+    tapped, rather than relying on the (possibly truncated) title."""
+    buttons = [
+        {"type": "reply", "reply": {"id": f"q_{i}", "title": opt[:20]}}
+        for i, opt in enumerate(options[:3])
+    ]
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": body[:1024]},
+            "action": {"buttons": buttons},
+        },
+    }
+    headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(WHATSAPP_GRAPH_URL, headers=headers, json=payload)
+        if resp.status_code >= 400:
+            logger.error("WhatsApp send failed (%s): %s", resp.status_code, resp.text[:500])
+
+
+async def _wa_send_option_list(to: str, body: str, options: list[str]) -> None:
+    """>3 options don't fit WhatsApp's button UI (max 3) — fall back to an
+    interactive list (max 10 rows)."""
+    rows = [{"id": f"q_{i}", "title": opt[:24]} for i, opt in enumerate(options[:10])]
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "list",
+            "body": {"text": body[:1024]},
+            "action": {"button": "Choose", "sections": [{"title": "Options", "rows": rows}]},
+        },
+    }
+    headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(WHATSAPP_GRAPH_URL, headers=headers, json=payload)
+        if resp.status_code >= 400:
+            logger.error("WhatsApp send failed (%s): %s", resp.status_code, resp.text[:500])
+
+
+async def _wa_send_hospital_list(to: str, hospitals: list[dict]) -> None:
+    """Interactive list message standing in for the frontend's hospital-
+    selection button. Row id carries the hospital id (prefixed so the
+    interactive handler can tell it apart from a q_N clarifying-question
+    reply); title/description carry name/address so the reply itself
+    contains enough to reconstruct the selection without a server-side
+    cache lookup."""
+    rows = [
+        {
+            "id": f"hosp_{h.get('id', i)}",
+            "title": (h.get("name") or "Hospital")[:24],
+            "description": (h.get("address") or "")[:72],
+        }
+        for i, h in enumerate(hospitals[:10])
+    ]
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "list",
+            "body": {"text": "Nearby hospitals — tap one to select it:"},
+            "action": {
+                "button": "Select hospital",
+                "sections": [{"title": "Nearby hospitals", "rows": rows}],
+            },
+        },
+    }
+    headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(WHATSAPP_GRAPH_URL, headers=headers, json=payload)
+        if resp.status_code >= 400:
+            logger.error("WhatsApp send failed (%s): %s", resp.status_code, resp.text[:500])
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  WHATSAPP — driving _stream_chat() from a webhook instead of a browser
+# ════════════════════════════════════════════════════════════════════════════
+
+def _parse_sse_frame(frame: str) -> tuple[str, dict | str]:
+    """_stream_chat() yields raw `event: X\\ndata: {...}\\n\\n` strings built
+    by _sse() — this reverses that so the WhatsApp consumer can branch on
+    (event, payload) the same way the frontend's SSE parser would, without
+    duplicating any of _stream_chat's own turn/dedupe/retry logic."""
+    event_line, _, rest = frame.partition("\n")
+    event = event_line.split(": ", 1)[1] if ": " in event_line else event_line
+    data_raw = rest.strip()
+    if data_raw.startswith("data: "):
+        data_raw = data_raw[len("data: "):]
+    try:
+        data = json.loads(data_raw)
+    except (json.JSONDecodeError, TypeError):
+        data = data_raw
+    return event, data
+
+
+def _format_guidance(payload: dict) -> str:
+    lines = []
+    if payload.get("priority_steps"):
+        lines.append("*Priority steps:*")
+        lines += [f"{i+1}. {s}" for i, s in enumerate(payload["priority_steps"])]
+    if payload.get("do_not"):
+        lines.append("\n*Do NOT:*")
+        lines += [f"⚠️ {s}" for s in payload["do_not"]]
+    if payload.get("watch_for"):
+        lines.append("\n*Watch for:*")
+        lines += [f"👀 {s}" for s in payload["watch_for"]]
+    if payload.get("reassurance"):
+        lines.append(f"\n{payload['reassurance']}")
+    if payload.get("when_to_update_me"):
+        lines.append(f"\n_Update me: {payload['when_to_update_me']}_")
+    return "\n".join(lines)
+
+
+def _format_quick_steps(payload: dict) -> str:
+    steps = payload.get("quick_steps", [])
+    return "*Do this now:*\n" + "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps))
+
+
+def _format_videos(payload: dict) -> str:
+    lines = ["Helpful videos:"]
+    for v in payload.get("videos", []):
+        lines.append(f"▶️ {v.get('title', 'Video')} — {v.get('url', '')}")
+    return "\n".join(lines)
+
+
+async def _wa_run_turn(sender: str, session_id: str, request: ChatRequest, is_new: bool) -> None:
+    """Consume _stream_chat's SSE frames and translate them into one or
+    more WhatsApp messages. Token text is buffered and flushed as a single
+    message right before any structured event (clarifying_question,
+    guidance, quick_steps, videos), matching the same ordering the
+    frontend renders (short ack text, then the structured card) without
+    needing WhatsApp-side streaming, which doesn't exist."""
+    buffer = ""
+
+    async def flush():
+        nonlocal buffer
+        if buffer.strip():
+            await _wa_send_text(sender, buffer.strip())
+        buffer = ""
+
+    async for frame in _stream_chat(session_id, request, is_new):
+        event, payload = _parse_sse_frame(frame)
+        if not isinstance(payload, dict):
+            continue
+
+        if event == "token":
+            buffer += payload.get("text", "")
+
+        elif event == "clarifying_question":
+            await flush()
+            options = payload.get("options", [])
+            whatsapp_pending_options[sender] = options
+            question = payload.get("question", "")
+            if not options:
+                await _wa_send_text(sender, question)
+            elif len(options) <= 3:
+                await _wa_send_buttons(sender, question, options)
+            else:
+                await _wa_send_option_list(sender, question, options)
+
+        elif event == "quick_steps":
+            await flush()
+            await _wa_send_text(sender, _format_quick_steps(payload))
+
+        elif event == "guidance":
+            await flush()
+            await _wa_send_text(sender, _format_guidance(payload))
+
+        elif event == "videos":
+            await flush()
+            await _wa_send_text(sender, _format_videos(payload))
+
+        elif event == "error":
+            await flush()
+            await _wa_send_text(sender, f"⚠️ {payload.get('message', 'Something went wrong.')}")
+
+        elif event == "done":
+            await flush()
+
+        # turn_started / status / retrying / activity are internal —
+        # deliberately not surfaced to WhatsApp, same as they're not
+        # rendered as their own bubble in a typical frontend either.
+
+    await flush()  # safety net in case `done` never fired (e.g. error path)
+
+
+async def _wa_start_or_continue(sender: str, message: str, location: dict | None = None) -> None:
+    """Builds the same ChatRequest /chat would build from a POST body, then
+    drives it through _wa_run_turn. `location` is only required on a
+    session's first turn — subsequent turns reuse whatever's cached on the
+    session (same as how the frontend only needs to resend it if it
+    changed)."""
+    session_id = whatsapp_sessions.get(sender)
+    is_new = session_id is None or session_id not in sessions
+
+    if is_new:
+        if location is None:
+            # Shouldn't happen if callers check first, but fail safe rather
+            # than crash a background task.
+            await _wa_send_text(sender, "Please share your location first so I can find nearby hospitals.")
+            return
+        session_id = str(uuid.uuid4())
+        whatsapp_sessions[sender] = session_id
+        sessions[session_id] = {
+            "thread_id":         session_id,
+            "location":          location,
+            "patient_profile":   PatientProfile().model_dump(),
+            "web_task_ids":      [],
+            "youtube_task_ids":  [],
+            "hospital_task_ids": [],
+            "subagent_status":   {},
+            "selected_hospital": None,
+        }
+    else:
+        if location is not None:
+            sessions[session_id]["location"] = location
+
+    req = ChatRequest(
+        session_id=session_id,
+        message=message,
+        location=Location(**sessions[session_id]["location"]),
+        patient_profile=PatientProfile(**sessions[session_id]["patient_profile"]),
+    )
+
+    await _wa_send_text(sender, "On it — finding help now…")
+    await _wa_run_turn(sender, session_id, req, is_new)
+
+
+async def _wa_handle_hospital_reply(sender: str, hospital_id: str, title: str, description: str) -> None:
+    session_id = whatsapp_sessions.get(sender)
+    if not session_id or session_id not in sessions:
+        await _wa_send_text(sender, "I've lost track of your session — please send your emergency again to restart.")
+        return
+    selection = HospitalSelection(id=hospital_id, name=title, address=description or None)
+    result = await select_hospital(session_id, selection)
+    data = json.loads(result.body)
+    eta = data["selected_hospital"].get("eta_minutes")
+    eta_text = f"~{eta:.0f} min away" if isinstance(eta, (int, float)) else "ETA unavailable"
+    await _wa_send_text(sender, f"Got it — heading to *{title}*. {eta_text}. I'll keep tracking this for you.")
+
+
+def _wa_verify_signature(payload_body: bytes, signature_header: str) -> bool:
+    if not signature_header or not WHATSAPP_APP_SECRET:
+        return False
+    expected = hmac.new(WHATSAPP_APP_SECRET.encode(), payload_body, hashlib.sha256).hexdigest()
+    received = signature_header.replace("sha256=", "")
+    return hmac.compare_digest(expected, received)
+
+
+def _wa_process_payload(payload: dict) -> None:
+    """Runs inside a BackgroundTask — the webhook route has already
+    returned its 200 by the time this executes, so nothing here can make
+    Meta think delivery failed / trigger a retry."""
+    for entry in payload.get("entry", []):
+        for change in entry.get("changes", []):
+            value = change.get("value", {})
+            for message in value.get("messages", []):
+                asyncio.create_task(_wa_dispatch_message(message))
+
+
+async def _wa_dispatch_message(message: dict) -> None:
+    msg_id = message.get("id")
+    if not msg_id or msg_id in seen_whatsapp_message_ids:
+        return  # dedup — Meta retries deliveries that don't get a fast 200
+    seen_whatsapp_message_ids.add(msg_id)
+
+    sender   = message["from"]
+    msg_type = message.get("type")
+
+    try:
+        if msg_type == "text":
+            text = message["text"]["body"]
+            if sender in whatsapp_pending_message and whatsapp_sessions.get(sender) is None:
+                # already waiting on a location share — don't start a
+                # second parallel turn, just refresh the stashed text
+                whatsapp_pending_message[sender] = text
+                return
+            if whatsapp_sessions.get(sender) is None:
+                whatsapp_pending_message[sender] = text
+                await _wa_send_text(
+                    sender,
+                    "Got it. Please share your location (📎 → Location) so I can find the nearest hospitals.",
+                )
+            else:
+                await _wa_start_or_continue(sender, text)
+
+        elif msg_type == "location":
+            loc = message["location"]
+            location = {
+                "lat":     loc["latitude"],
+                "lng":     loc["longitude"],
+                "address": loc.get("address") or loc.get("name") or "Shared via WhatsApp",
+            }
+            pending_text = whatsapp_pending_message.pop(sender, None)
+            message_text = pending_text or "Emergency — see shared location."
+            await _wa_start_or_continue(sender, message_text, location=location)
+
+        elif msg_type == "interactive":
+            interactive  = message.get("interactive", {})
+            reply        = interactive.get("button_reply") or interactive.get("list_reply")
+            if not reply:
+                return
+            reply_id = reply.get("id", "")
+
+            if reply_id.startswith("hosp_"):
+                await _wa_handle_hospital_reply(
+                    sender,
+                    hospital_id=reply_id[len("hosp_"):],
+                    title=reply.get("title", "Selected hospital"),
+                    description=reply.get("description", ""),
+                )
+            elif reply_id.startswith("q_"):
+                idx = int(reply_id[len("q_"):])
+                options = whatsapp_pending_options.get(sender, [])
+                full_text = options[idx] if 0 <= idx < len(options) else reply.get("title", "")
+                await _wa_start_or_continue(sender, full_text)
+
+        # other types (image, audio, unsupported) are silently ignored
+        # for now — flag to the user rather than dropping silently:
+        else:
+            await _wa_send_text(sender, "I can only read text and shared location right now.")
+
+    except Exception:
+        logger.exception("WhatsApp message handling failed (sender=%s)", sender)
+        await _wa_send_text(sender, "Something went wrong on our end — please try again.")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  WHATSAPP — webhook routes
+# ════════════════════════════════════════════════════════════════════════════
+
+@app.get("/webhook/whatsapp")
+async def whatsapp_verify(request: Request):
+    """Meta hits this once, whenever the Callback URL / Verify token
+    fields are (re)saved in the App Dashboard."""
+    if (
+        request.query_params.get("hub.mode") == "subscribe"
+        and request.query_params.get("hub.verify_token") == WHATSAPP_VERIFY_TOKEN
+    ):
+        return PlainTextResponse(request.query_params.get("hub.challenge", ""), status_code=200)
+    return PlainTextResponse("Forbidden", status_code=403)
+
+
+@app.post("/webhook/whatsapp")
+async def whatsapp_receive(request: Request, background_tasks: BackgroundTasks):
+    """Every inbound WhatsApp event lands here. Must return 200 fast —
+    the actual agent turn (which can take several seconds) runs as a
+    background task so Meta never times out waiting on it and retries."""
+    raw_body = await request.body()
+    if not _wa_verify_signature(raw_body, request.headers.get("X-Hub-Signature-256", "")):
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
+    payload = json.loads(raw_body)
+    background_tasks.add_task(_wa_process_payload, payload)
+    return Response(status_code=200)
 
 
 # ════════════════════════════════════════════════════════════════════════════
