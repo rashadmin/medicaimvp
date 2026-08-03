@@ -1380,15 +1380,29 @@ def _wa_verify_signature(payload_body: bytes, signature_header: str) -> bool:
     return hmac.compare_digest(expected, received)
 
 
-def _wa_process_payload(payload: dict) -> None:
-    """Runs inside a BackgroundTask — the webhook route has already
-    returned its 200 by the time this executes, so nothing here can make
-    Meta think delivery failed / trigger a retry."""
-    for entry in payload.get("entry", []):
-        for change in entry.get("changes", []):
-            value = change.get("value", {})
-            for message in value.get("messages", []):
-                asyncio.create_task(_wa_dispatch_message(message))
+async def _wa_process_payload(payload: dict) -> None:
+    """Runs as a BackgroundTask. Must be `async def` — FastAPI runs sync
+    background functions in a worker thread with no event loop, which is
+    exactly what broke `asyncio.create_task(...)` here before (RuntimeError:
+    no running event loop). Being async means BackgroundTasks awaits this
+    directly on the main event loop instead, so awaiting _wa_dispatch_message
+    below is safe.
+
+    By the time this executes, the webhook route has already returned its
+    200, so nothing in here can make Meta think delivery failed / retry."""
+    messages = [
+        message
+        for entry in payload.get("entry", [])
+        for change in entry.get("changes", [])
+        for message in change.get("value", {}).get("messages", [])
+    ]
+    # Multiple messages in one batch are handled concurrently rather than
+    # one-by-one, so a slow agent turn for one sender doesn't delay the
+    # webhook's internal processing of another sender's message.
+    await asyncio.gather(
+        *(_wa_dispatch_message(message) for message in messages),
+        return_exceptions=True,
+    )
 
 
 async def _wa_dispatch_message(message: dict) -> None:
