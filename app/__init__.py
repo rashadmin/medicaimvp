@@ -1,0 +1,1 @@
+"""MedicaAI MVP Application Package"""
