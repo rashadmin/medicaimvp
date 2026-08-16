@@ -1,5 +1,5 @@
 """Agent Services Package"""
-from .supervisor import agent, make_config, build_input, checkpointer, estimate_eta_minutes
+from .supervisor import agent, graph, make_config, build_input, checkpointer, estimate_eta_minutes
 from .tools import (
     analyse_emergency,
     resolve_uncertainty,
@@ -11,6 +11,7 @@ from .tools import (
 
 __all__ = [
     "agent",
+    "graph",
     "make_config",
     "build_input",
     "checkpointer",
