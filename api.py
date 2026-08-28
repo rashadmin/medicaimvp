@@ -1386,10 +1386,38 @@ async def _wa_start_or_continue(sender: str, message: str, location: dict | None
     await _wa_run_turn(sender, session_id, req, is_new)
 
 
+# Tight, explicit set of common openers only — deliberately NOT a generic
+# "short message" heuristic. A misclassified real emergency ("help now" /
+# "he's not breathing") costs a full turn during a crisis, so this only
+# matches when the WHOLE message is essentially just a greeting; anything
+# it doesn't confidently recognize falls through to the emergency path by
+# default (false negatives here are the safe direction, not false
+# positives).
+_GREETING_RE = re.compile(
+    r"^\s*(hi+|hello+|hey+|yo|sup|howdy|greetings|hiya|"
+    r"good\s?(morning|afternoon|evening|day))[\s!.,]*$",
+    re.IGNORECASE,
+)
+_GREETING_MAX_LEN = 40  # a bare greeting is short; an emergency description generally isn't
+
+
+def _looks_like_greeting(text: str) -> bool:
+    stripped = (text or "").strip()
+    if not stripped or len(stripped) > _GREETING_MAX_LEN:
+        return False
+    return bool(_GREETING_RE.match(stripped))
+
+
 async def _wa_handle_text(sender: str, text: str) -> None:
     """Called with the sender's lock held. Matches an inbound text message
     against any location that arrived first, so the two combine into one
-    agent turn no matter which order they came in."""
+    agent turn no matter which order they came in.
+
+    The very first message can reasonably be either a greeting ("hi") or
+    the emergency itself ("my father was stabbed") — distressed users
+    typically skip pleasantries, so this defaults to treating a first
+    message as the emergency description unless it's unambiguously just a
+    greeting (see _looks_like_greeting)."""
     if whatsapp_sessions.get(sender) is not None:
         # ongoing conversation — just a normal follow-up turn
         await _wa_start_or_continue(sender, text)
@@ -1398,19 +1426,38 @@ async def _wa_handle_text(sender: str, text: str) -> None:
     pending_location = whatsapp_pending_location.pop(sender, None)
     if pending_location is not None:
         # location was shared first and was waiting on a description —
-        # this text completes it, start the turn now
+        # this text completes it, start the turn now. (Not greeting-checked
+        # here: they were already explicitly asked what's happening, so
+        # whatever they send back is treated as that answer.)
         await _wa_start_or_continue(sender, text, location=pending_location)
         return
 
-    # brand-new conversation, no location yet — stash the text (silently
-    # replacing any earlier stashed text) and ask for a location, but only
-    # nag once per wait rather than on every message that comes in
+    if _looks_like_greeting(text):
+        # Bare "hi" with nothing else stashed yet — don't jump straight to
+        # asking for location off a plain greeting, and deliberately do NOT
+        # stash it into whatsapp_pending_message: "hi" must never become
+        # the text that gets combined with a location a moment later as if
+        # it were the emergency description.
+        await _wa_send_text(
+            sender,
+            "👋 Hi, this is *MedicAI* — your emergency first-aid assistant. "
+            "Tell me what's happening (what happened, symptoms, who it's "
+            "for) and I'll help right away.",
+        )
+        return
+
+    # Reads as an actual description of what's wrong — stash it and ask for
+    # location, referencing that we've got the description so the prompt
+    # doesn't feel like a generic, unrelated form field right after someone
+    # describes an emergency. Only nag once per wait rather than on every
+    # message that comes in.
     already_waiting = sender in whatsapp_pending_message
     whatsapp_pending_message[sender] = text
     if not already_waiting:
         await _wa_send_text(
             sender,
-            "Got it. Please share your location (📎 → Location) so I can find the nearest hospitals.",
+            "Got it — to find the nearest help, please share your location "
+            "(📎 → Location).",
         )
 
 
