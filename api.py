@@ -96,6 +96,33 @@ whatsapp_sessions: dict[str, str] = {}
 # message, then resume once the location share arrives.
 whatsapp_pending_message: dict[str, str] = {}
 
+# phone number -> location received before we had a description of what's
+# actually wrong. WhatsApp's location-share UI doesn't let the user attach
+# a caption, so if location arrives first we stash it here and ask what's
+# happening — mirrors whatsapp_pending_message above so text-first and
+# location-first are handled symmetrically instead of location-first
+# falling back to a placeholder ("Emergency — see shared location.") that
+# tells the agent nothing about the actual emergency.
+whatsapp_pending_location: dict[str, dict] = {}
+
+# phone number -> asyncio.Lock, serializing all pending-state mutations for
+# that sender. Without this, a text message and a location share that
+# arrive close together (either batched into one Meta payload — dispatched
+# concurrently via asyncio.gather — or as two near-simultaneous webhook
+# POSTs, each its own BackgroundTask) can race on whatsapp_pending_message /
+# whatsapp_pending_location: e.g. the location handler can check for a
+# stashed text before the text handler has finished stashing it, so each
+# starts its own turn instead of the two being combined into one.
+whatsapp_sender_locks: dict[str, asyncio.Lock] = {}
+
+
+def _wa_lock(sender: str) -> asyncio.Lock:
+    lock = whatsapp_sender_locks.get(sender)
+    if lock is None:
+        lock = asyncio.Lock()
+        whatsapp_sender_locks[sender] = lock
+    return lock
+
 # phone number -> the exact option strings for the clarifying_question
 # currently on offer, so a tapped WhatsApp button (title truncated to 20
 # chars by WhatsApp itself) can be resolved back to the full original
@@ -1359,6 +1386,66 @@ async def _wa_start_or_continue(sender: str, message: str, location: dict | None
     await _wa_run_turn(sender, session_id, req, is_new)
 
 
+async def _wa_handle_text(sender: str, text: str) -> None:
+    """Called with the sender's lock held. Matches an inbound text message
+    against any location that arrived first, so the two combine into one
+    agent turn no matter which order they came in."""
+    if whatsapp_sessions.get(sender) is not None:
+        # ongoing conversation — just a normal follow-up turn
+        await _wa_start_or_continue(sender, text)
+        return
+
+    pending_location = whatsapp_pending_location.pop(sender, None)
+    if pending_location is not None:
+        # location was shared first and was waiting on a description —
+        # this text completes it, start the turn now
+        await _wa_start_or_continue(sender, text, location=pending_location)
+        return
+
+    # brand-new conversation, no location yet — stash the text (silently
+    # replacing any earlier stashed text) and ask for a location, but only
+    # nag once per wait rather than on every message that comes in
+    already_waiting = sender in whatsapp_pending_message
+    whatsapp_pending_message[sender] = text
+    if not already_waiting:
+        await _wa_send_text(
+            sender,
+            "Got it. Please share your location (📎 → Location) so I can find the nearest hospitals.",
+        )
+
+
+async def _wa_handle_location(sender: str, location: dict) -> None:
+    """Called with the sender's lock held. Matches an inbound location
+    share against any text that arrived first, so the two combine into one
+    agent turn no matter which order they came in."""
+    if whatsapp_sessions.get(sender) is not None:
+        # ongoing conversation — refresh the stored location, but don't
+        # kick off a fresh agent turn off a bare location share
+        session_id = whatsapp_sessions[sender]
+        sessions[session_id]["location"] = location
+        await _wa_send_text(sender, "📍 Location updated.")
+        return
+
+    pending_text = whatsapp_pending_message.pop(sender, None)
+    if pending_text is not None:
+        # text was sent first and was waiting on a location — this
+        # completes it, start the turn now
+        await _wa_start_or_continue(sender, pending_text, location=location)
+        return
+
+    # location arrived with nothing to attach it to — stash it and ask
+    # what's actually going on, instead of silently starting a turn with a
+    # placeholder ("Emergency — see shared location.") that tells the
+    # agent nothing about the real emergency
+    already_waiting = sender in whatsapp_pending_location
+    whatsapp_pending_location[sender] = location
+    if not already_waiting:
+        await _wa_send_text(
+            sender,
+            "📍 Got your location. Please describe what's happening (symptoms, what happened, who it's for, etc.) so I can help.",
+        )
+
+
 async def _wa_handle_hospital_reply(sender: str, hospital_id: str, title: str, description: str) -> None:
     session_id = whatsapp_sessions.get(sender)
     if not session_id or session_id not in sessions:
@@ -1417,19 +1504,8 @@ async def _wa_dispatch_message(message: dict) -> None:
     try:
         if msg_type == "text":
             text = message["text"]["body"]
-            if sender in whatsapp_pending_message and whatsapp_sessions.get(sender) is None:
-                # already waiting on a location share — don't start a
-                # second parallel turn, just refresh the stashed text
-                whatsapp_pending_message[sender] = text
-                return
-            if whatsapp_sessions.get(sender) is None:
-                whatsapp_pending_message[sender] = text
-                await _wa_send_text(
-                    sender,
-                    "Got it. Please share your location (📎 → Location) so I can find the nearest hospitals.",
-                )
-            else:
-                await _wa_start_or_continue(sender, text)
+            async with _wa_lock(sender):
+                await _wa_handle_text(sender, text)
 
         elif msg_type == "location":
             loc = message["location"]
@@ -1438,9 +1514,8 @@ async def _wa_dispatch_message(message: dict) -> None:
                 "lng":     loc["longitude"],
                 "address": loc.get("address") or loc.get("name") or "Shared via WhatsApp",
             }
-            pending_text = whatsapp_pending_message.pop(sender, None)
-            message_text = pending_text or "Emergency — see shared location."
-            await _wa_start_or_continue(sender, message_text, location=location)
+            async with _wa_lock(sender):
+                await _wa_handle_location(sender, location)
 
         elif msg_type == "interactive":
             interactive  = message.get("interactive", {})
