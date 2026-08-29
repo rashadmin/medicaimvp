@@ -133,6 +133,17 @@ whatsapp_pending_options: dict[str, list[str]] = {}
 # get a fast 200, so the same message can arrive more than once.
 seen_whatsapp_message_ids: set[str] = set()
 
+# session_id -> asyncio.Task, the background poller (see
+# _wa_poll_subagent_results) that watches for youtube_subagent /
+# hospital_notifier results finishing AFTER a WhatsApp turn's own SSE
+# stream has already closed. WhatsApp has no long-lived connection to push
+# through the way the frontend's open SSE stream (or its own follow-up
+# GET /session/videos, /session/hospitals polling) does, so without this
+# a slow subagent's result is simply never delivered to a WhatsApp user.
+# Tracked per session so a new turn doesn't spawn a duplicate poller
+# on top of one already watching the same session.
+whatsapp_subagent_pollers: dict[str, asyncio.Task] = {}
+
 
 # Tool calls that mark a real, user-noticeable wait between turns. When the
 # supervisor starts one of these, the client should already have shown the
@@ -1289,6 +1300,102 @@ def _format_videos(payload: dict) -> str:
     return "\n".join(lines)
 
 
+def _extract_hospitals_ready(tool_calls: list[dict]) -> list[dict] | None:
+    """Mirrors _extract_videos_ready, but for the hospital_notifier
+    subagent: its result isn't marked with a prefix like VIDEOS_READY —
+    the hospital list comes back as the `content` of a broadcast_to_hospitals
+    tool call within the thread (same shape GET /session/hospitals/{id}
+    already parses). Returns None if that tool call hasn't shown up yet."""
+    for tc in tool_calls:
+        if tc.get("name") != "broadcast_to_hospitals":
+            continue
+        try:
+            parsed = json.loads(tc.get("content") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(parsed, list) and parsed:
+            return parsed
+    return None
+
+
+async def _wa_poll_subagent_results(sender: str, session_id: str) -> None:
+    """Background task, detached from any single turn's SSE stream —
+    watches this session's youtube_subagent / hospital_notifier task ids
+    and delivers results to WhatsApp as WhatsApp messages the moment
+    they're ready, however long after the triggering turn that turns out
+    to be. This is WhatsApp's equivalent of the frontend polling
+    GET /session/videos/{id} and GET /session/hospitals/{id} after its SSE
+    connection closes — WhatsApp has no open connection to poll against,
+    so this has to be a standalone background loop instead.
+
+    One instance runs per session (see whatsapp_subagent_pollers) and
+    re-checks every task id currently on the session each tick, so it also
+    picks up new task ids added by a later turn (e.g. a technique change
+    triggering a second youtube_subagent call) without needing a fresh
+    poller spawned for each one."""
+    deadline = asyncio.get_event_loop().time() + SUBAGENT_MAX_WAIT
+    sent_video_task_ids: set[str] = set()
+    hospitals_sent = False
+
+    while asyncio.get_event_loop().time() < deadline:
+        session = sessions.get(session_id)
+        if not session:
+            return
+
+        for tid in session.get("youtube_task_ids", []):
+            if tid in sent_video_task_ids:
+                continue
+            result = await _read_subagent_thread(tid)
+            if not result:
+                continue
+            videos = _extract_videos_ready(result.get("final", ""))
+            if videos:
+                sent_video_task_ids.add(tid)
+                await _wa_send_text(sender, _format_videos({"videos": videos}))
+
+        if not hospitals_sent:
+            for tid in session.get("hospital_task_ids", []):
+                result = await _read_subagent_thread(tid)
+                if not result:
+                    continue
+                hospitals = _extract_hospitals_ready(result.get("tool_calls", []))
+                if hospitals:
+                    hospitals_sent = True
+                    await _wa_send_hospital_list(sender, hospitals)
+                    break
+
+        # Stop early once there's nothing left to wait on (all known video
+        # tasks delivered, hospitals delivered or none were ever launched)
+        # — no point burning the full SUBAGENT_MAX_WAIT budget silently.
+        all_videos_done = all(
+            tid in sent_video_task_ids for tid in session.get("youtube_task_ids", [])
+        )
+        no_hospital_task = not session.get("hospital_task_ids")
+        if all_videos_done and (hospitals_sent or no_hospital_task):
+            return
+
+        await asyncio.sleep(SUBAGENT_POLL_SECS)
+
+    # Timed out — deliberately silent rather than sending a "still
+    # searching" message: the guidance/quick_steps/hospital-selection
+    # already sent earlier in the turn is the actionable content: videos
+    # and a hospital shortlist are supplementary, not something worth
+    # interrupting the user about failing.
+
+
+def _wa_ensure_poller(sender: str, session_id: str) -> None:
+    """(Re)start the background poller for this session if one isn't
+    already running — called every turn so a fresh poller picks up newly
+    launched task ids even if an earlier poller for this session already
+    finished/timed out."""
+    existing = whatsapp_subagent_pollers.get(session_id)
+    if existing is not None and not existing.done():
+        return
+    whatsapp_subagent_pollers[session_id] = asyncio.create_task(
+        _wa_poll_subagent_results(sender, session_id)
+    )
+
+
 async def _wa_run_turn(sender: str, session_id: str, request: ChatRequest, is_new: bool) -> None:
     """Consume _stream_chat's SSE frames and translate them into one or
     more WhatsApp messages. Token text is buffered and flushed as a single
@@ -1389,6 +1496,7 @@ async def _wa_start_or_continue(sender: str, message: str, location: dict | None
     )
 
     await _wa_send_text(sender, "On it — finding help now…")
+    _wa_ensure_poller(sender, session_id)
     await _wa_run_turn(sender, session_id, req, is_new)
 
 
