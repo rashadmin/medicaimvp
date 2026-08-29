@@ -1079,7 +1079,13 @@ async def _stream_chat(
     # so the buffer would otherwise be silently dropped: sent as neither
     # `token` nor `internal_output`, just gone. Catch any such states here
     # and resolve them now that we know the message is actually finished.
-    for msg_id, state in message_state.items():
+    # Snapshot via list(...) — the loop body below can call
+    # message_state.setdefault("_tool_narratives", []), which inserts a new
+    # key into message_state the first time it's called. Iterating the live
+    # dict directly raises "dictionary changed size during iteration" the
+    # first time that happens in a given turn; iterating a snapshot avoids
+    # it regardless of what the loop body mutates.
+    for msg_id, state in list(message_state.items()):
         if not isinstance(state, dict) or msg_id == "_current_attempt":
             continue
         if state.get("mode") != "text" or state.get("dedupe_decided"):

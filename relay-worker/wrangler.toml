@@ -7,3 +7,10 @@ compatibility_date = "2024-11-01"
 [[kv_namespaces]]
 binding = "WAKE_KV"
 id = "20735c5e44134050bc221e8c996f8d53"
+[[durable_objects.bindings]]
+name = "WAKER"
+class_name = "RenderWaker"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RenderWaker"]
